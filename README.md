@@ -12,6 +12,7 @@ Crossfade, spatial headphone sound, nature themes, and a native engine that bare
 ![Rust](https://img.shields.io/badge/Rust-audio%20engine-CE422B?logo=rust&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Offline](https://img.shields.io/badge/works-offline-2ea44f)
+![License](https://img.shields.io/badge/license-MIT-blue)
 ![Status](https://img.shields.io/badge/status-v0.1%20·%20personal%20project-orange)
 
 <img src="docs/screenshots/now.jpg" alt="FocusFlow – Now Playing on the Stargazing theme" width="100%" />
@@ -271,4 +272,4 @@ The screenshots come from the real interface running with demo data (`src/dev/mo
 
 ## Legal
 
-FocusFlow contains no music and no third-party artwork; every cover and landscape is generated. It is a tool for playing audio you are entitled to use. The link-import feature drives the separately installed `yt-dlp` and `ffmpeg`; you are responsible for complying with the terms of any site you use it with and with copyright law. No license has been chosen for this repository yet.
+FocusFlow contains no music and no third-party artwork; every cover and landscape is generated. It is a tool for playing audio you are entitled to use. The link-import feature drives the separately installed `yt-dlp` and `ffmpeg`; you are responsible for complying with the terms of any site you use it with and with copyright law. FocusFlow's own code is released under the [MIT License](LICENSE). Third-party libraries keep their own licenses.
