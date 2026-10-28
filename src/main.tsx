@@ -14,4 +14,6 @@ async function boot() {
     </React.StrictMode>,
   );
 }
-void boot();
+void boot().then(() => {
+  if (import.meta.env.DEV) void import("./dev/shots").then((m) => m.run());
+});

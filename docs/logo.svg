@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="FocusFlow">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b2347"/>
+      <stop offset="1" stop-color="#05070f"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff7a8a"/>
+      <stop offset="1" stop-color="#ff4f64"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="58" fill="url(#bg)"/>
+  <g fill="#fff" opacity=".85">
+    <circle cx="52" cy="58" r="2"/><circle cx="196" cy="44" r="1.6"/><circle cx="214" cy="92" r="1.2"/>
+    <circle cx="86" cy="36" r="1.2"/><circle cx="40" cy="104" r="1.4"/><circle cx="170" cy="70" r="1"/>
+  </g>
+  <path d="M128 128c-18-30-34-44-54-44a44 44 0 000 88c20 0 36-14 54-44zm0 0c18 30 34 44 54 44a44 44 0 000-88c-20 0-36 14-54 44z"
+        fill="none" stroke="url(#mark)" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

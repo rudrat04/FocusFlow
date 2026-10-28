@@ -1,133 +1,263 @@
+<div align="center">
+
+<img src="docs/logo.svg" alt="FocusFlow logo" width="120" />
+
 # FocusFlow
 
-A dark, glass-style music player for long work sessions on macOS (built for Apple Silicon), laid out like Apple Music. It plays audio files from your own library with crossfade, a sleep timer, a headphone spatializer, cover art, eight static nature themes, and an optional keep-awake mode. It works fully offline: no account, backend, subscription or AI API is needed to play music.
+**A calm, Apple Music-style player for long work sessions on macOS.**
+Crossfade, spatial headphone sound, nature themes, and a native engine that barely sips power.
 
-**FocusFlow ships with no music.** You add your own: files you made, own or are licensed to use.
+![Platform](https://img.shields.io/badge/platform-macOS%20·%20Apple%20Silicon-black?logo=apple)
+![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)
+![Rust](https://img.shields.io/badge/Rust-audio%20engine-CE422B?logo=rust&logoColor=white)
+![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
+![Offline](https://img.shields.io/badge/works-offline-2ea44f)
+![Status](https://img.shields.io/badge/status-v0.1%20·%20personal%20project-orange)
 
-## Quick start
+<img src="docs/screenshots/now.jpg" alt="FocusFlow – Now Playing on the Stargazing theme" width="100%" />
+
+<sub>Screenshots use invented demo songs and generated covers. FocusFlow ships with no music.</sub>
+
+</div>
+
+---
+
+## Contents
+
+[Highlights](#highlights) · [Screenshots](#screenshots) · [Install](#install) · [Add your music](#add-your-music) · [Features](#features) · [Keyboard shortcuts](#keyboard-shortcuts) · [Efficiency](#efficiency) · [How it works](#how-it-works) · [Testing](#testing-and-honest-status) · [Limitations](#known-limitations) · [Troubleshooting](#troubleshooting)
+
+## Highlights
+
+- **A real native audio engine.** Rust (`symphonia` + `cpal`) decodes MP3, M4A/AAC, FLAC, WAV and OGG, mixes with equal-power **crossfade (0–12 s)**, and handles track changes itself, so playback never depends on a webview timer.
+- **Spatial sound for headphones.** Wide, Room and Orbit modes with an intensity slider, tested to make a clearly audible difference.
+- **Earbuds and media keys just work.** FocusFlow registers as the macOS *Now Playing* app, so AirPods/Bluetooth buttons, keyboard media keys and Control Center control it instead of a paused browser tab.
+- **Import from a link.** Paste a video or album link and FocusFlow downloads the audio and **splits it into separate tracks**, even when the video has no chapters.
+- **Albums, playlists, favorites, queue**, all editable: rename, add, remove, reorder, drag to reorder.
+- **Six static nature themes**, sleep timer with a gentle fade, optional keep-awake.
+- **Light on power.** Nothing animates, and the engine sleeps between bursts of work. See [Efficiency](#efficiency).
+- **Offline and private.** No account, no backend, no subscription, no AI API. Your library lives in a folder you choose.
+
+## Screenshots
+
+| | |
+|:--:|:--:|
+| <img src="docs/screenshots/songs.jpg" alt="Songs"/><br/><sub><b>Songs</b>: search, filter, click a thumbnail to play</sub> | <img src="docs/screenshots/albums.jpg" alt="Albums"/><br/><sub><b>Albums</b>: grid of covers</sub> |
+| <img src="docs/screenshots/album.jpg" alt="An album"/><br/><sub><b>Album page</b>: Play, Shuffle, Edit</sub> | <img src="docs/screenshots/song.jpg" alt="A song page"/><br/><sub><b>Song page</b>: details, editable title/artist/album</sub> |
+| <img src="docs/screenshots/sound.jpg" alt="Spatial sound menu"/><br/><sub><b>Spatial sound</b>: Off · Wide · Room · Orbit</sub> | <img src="docs/screenshots/link.jpg" alt="Add from link"/><br/><sub><b>Add from link</b>: into your library, a new album, or a new playlist</sub> |
+| <img src="docs/screenshots/playlists.jpg" alt="Playlists"/><br/><sub><b>Playlists</b></sub> | <img src="docs/screenshots/settings.jpg" alt="Settings"/><br/><sub><b>Settings</b>: themes, playback, power</sub> |
+
+### Themes
+
+Each theme is drawn from code (no photographs, nothing to license) and is completely static.
+
+| Forest | Ocean | Mountains |
+|:--:|:--:|:--:|
+| <img src="docs/screenshots/theme-forest.jpg" alt="Forest theme"/> | <img src="docs/screenshots/theme-ocean.jpg" alt="Ocean theme"/> | <img src="docs/screenshots/theme-mountains.jpg" alt="Mountains theme"/> |
+| **Desert** | **Northern lights** | **Stargazing** *(default)* |
+| <img src="docs/screenshots/theme-desert.jpg" alt="Desert theme"/> | <img src="docs/screenshots/theme-aurora.jpg" alt="Northern lights theme"/> | <img src="docs/screenshots/now.jpg" alt="Stargazing theme"/> |
+
+## Install
+
+FocusFlow is built from source. You need macOS on Apple Silicon, [Node.js](https://nodejs.org), [Rust](https://rustup.rs) and the Xcode Command Line Tools (`xcode-select --install`).
 
 ```bash
 git clone https://github.com/rudrat04/FocusFlow.git
 cd FocusFlow
+npm install
+npm run tauri build
 ```
 
-Requirements: macOS on Apple Silicon, Node.js, Rust (`rustup`), Xcode Command Line Tools.
-For "Add from link" only: `brew install yt-dlp ffmpeg`.
+The build produces:
+
+- `src-tauri/target/release/bundle/macos/FocusFlow.app`, which you can drag into `/Applications`
+- `src-tauri/target/release/bundle/dmg/FocusFlow_0.1.0_aarch64.dmg`
+
+The app is **unsigned**: the first time you open it, right-click → **Open**. (Distributing it to other people would need an Apple Developer ID and notarization.)
+
+For development with hot reload: `npm run tauri dev`.
+
+**Optional, for "Add from link" only:**
 
 ```bash
-npm install
-npm run tauri dev        # run the app in development
-npm test                 # frontend logic tests (queue, shuffle/repeat, timers, transitions)
-cd src-tauri && cargo test --lib   # backend tests (engine, library, playlists, link parsing, keep-awake)
-npm run tauri build      # production build: .app and .dmg
-./scripts/selftest.sh    # drives the built app end to end (quiet audio for ~1 min)
+brew install yt-dlp ffmpeg
 ```
 
-What was actually tested, and what was not: see `TEST_REPORT.md`. Long-run and sleep/wake tests are in `MANUAL_TEST_CHECKLIST.md` and have **not** been performed yet.
+## Add your music
 
-Build output:
+FocusFlow plays audio files you own or are licensed to use. Three ways to add them:
 
-- App: `src-tauri/target/release/bundle/macos/FocusFlow.app`
-- Installer: `src-tauri/target/release/bundle/dmg/FocusFlow_0.1.0_aarch64.dmg`
+1. **Import files or a folder:** Songs → *Files* / *Folder*, or drag audio onto the window. Files are copied into your library folder (`~/Music/FocusFlow` by default, changeable) so moving the originals never breaks anything. Duplicates are detected by content; unreadable files are reported and skipped.
+2. **Drop files into the library folder** and press **Rescan**.
+3. **Add from link:** paste one or more links (see below).
 
-The build is unsigned. The first time you open it from the DMG, right-click the app → **Open**. It is fine for your own Mac; distributing to others would need an Apple Developer ID and notarization.
+### Add from link
 
-## Adding music
+Pick the destination first: your **Music library**, a **New album** (every track gets that name) or a **New playlist**. Then FocusFlow finds the tracks:
 
-- **Import files / folder:** Library → Files or Folder, or drag audio onto the window. MP3, M4A/AAC, WAV and FLAC are supported (OGG too). Files are copied into your library folder (`~/Music/FocusFlow` by default, outside the app, so you can add music without rebuilding). Duplicates are detected by content and skipped; unreadable files are reported and not imported.
-- **Drop files in the folder:** put audio into `~/Music/FocusFlow` and press **Rescan**.
-- **Add from link:** paste one or more links. FocusFlow uses your installed `yt-dlp` and `ffmpeg` to download the audio, then splits it into separate MP3 tracks (cover = the video's thumbnail). Before importing, choose where the tracks go: just your **Music library**, a **New album** (every track gets that name), or a **New playlist**. How it finds the tracks:
-  1. **A video with chapters:** one track per chapter.
-  2. **A video without chapters** (with "Find the tracks automatically" on, the default), in this order: the timestamps you paste into the box; a timestamped track list in the **description**; a track list in the **top comments** (many mixes pin one); then **silence between tracks**, found by listening to the audio. Tracks found by silence are named "Track 1, 2, 3…" because the audio has no titles; rename them on each song's page. If nothing is found, it stays one track.
-  3. **An album or playlist link** (for example `music.youtube.com/playlist?list=…`): every entry becomes its own track with its own title and thumbnail, and the album gets the playlist's name. A link to a single video that merely includes `&list=` imports just that video; paste the playlist link itself to get them all.
-
-  Only import audio you have the right to keep; downloading can violate a site's terms. If a download stops working, update the tool: `brew upgrade yt-dlp`. Silence detection can't split a continuous, gapless mix; for those, paste timestamps.
-
-## Using it
-
-| Section | What it does |
+| Link type | What happens |
 |---|---|
-| Now Playing | Large cover art, seek bar, transport, a sound-mode menu beside Shuffle, and the queue (play, reorder, remove). |
-| Songs | Search, filter (all / favorites / missing), import, rescan. Click a title to open its song page. |
-| Albums | Grid of albums. Open one to Play, Shuffle or Edit (rename it, add songs, remove songs, delete the album). “New album” builds one from songs you pick. |
-| Playlists | Create, Play, Shuffle, and Edit (rename, add songs, remove, reorder, delete). Songs can also be added from a song's “…” menu. |
-| Favorites | Tracks you hearted. |
-| Settings | Theme, crossfade (0–12 s, default 3), shuffle/repeat defaults, spatial audio, sleep timer, power, library folder. |
+| **Video with chapters** | One track per chapter. |
+| **Video without chapters** | Tried in order: your pasted timestamps → a timestamped track list in the **description** → a track list in the **top comments** → **silence between tracks**. Silence-detected tracks are named "Track 1, 2, …" (rename them on the song page). If nothing is found it stays one track. |
+| **Album / playlist link** (e.g. `music.youtube.com/playlist?list=…`) | Every entry becomes its own track with its own title and thumbnail; the album takes the playlist's name. |
 
-Clicking a song's **thumbnail** in any list, or the cover or title in the bottom bar, opens Now Playing. The bar at the bottom works like Apple Music's: shuffle, previous, play/pause, next and repeat on the left; a "now playing" display with progress in the middle ; sleep timer, spatial audio and volume on the right.
+The video's thumbnail becomes the cover art. A single-video link that merely contains `&list=` imports only that video; paste the playlist link itself to get them all. A continuous, gapless mix with no written track list can't be split by silence; paste timestamps for those.
 
-**Song page:** click any song title in a list for its cover art, details (duration, format, sample rate, channels, size, date added, playlists, file path, source link), and actions, and you can edit its title, artist and album. 
+> Only import audio you have the right to keep. Downloading can violate a site's terms. If a download stops working, run `brew upgrade yt-dlp`.
 
-**Thumbnails:** clicking a song's thumbnail in any list plays it and opens Now Playing.
+## Features
 
-### Themes
+### Playback
 
-Settings → Theme: **Stargazing** (the original), **Forest**, **Ocean**, **Mountains**, **Desert** and **Northern lights**. Each has its own colours and accent and a generated landscape. The scenes are drawn in code (nothing is licensed) and are **static**: nothing animates, so they cost no GPU time while you listen.
+- Play, pause, previous (restarts the track after 3 s), next, seek, volume, mute.
+- **Shuffle** (each lap reshuffles without repeating the last song first) and **repeat** off / all / one.
+- **Queue**: play next, add to end, remove, move up/down, or drag by the handle.
+- **Gapless or crossfaded** transitions; the next track is preloaded so there is no gap.
+- Restores your queue and position on launch, **paused**, never playing by itself.
+- A track that fails is logged, you get a toast, and playback skips to the next playable one.
 
-### Efficiency
+### Library
 
-FocusFlow is built to stay cool and sip power: no animations, static scenes, and almost no background wake-ups. The audio engine sleeps between short bursts of decoding, progress is reported twice a second (every few seconds when the window is hidden), and only the progress bars redraw. `scripts/bench.sh` measures it. On an M2 MacBook Air, plugged in, with the window in front, playing used roughly **2–5% of one CPU core** (≈ 0.3–0.6% of the whole chip) and about 250–290 MB of RAM; with the window hidden to the menu bar about **2%**, and paused under 1%. An earlier build that had animations used 12–64%. Battery drain itself was not measured (see TEST_REPORT.md).
+- Songs, Albums, Playlists and Favorites, with search and filters (all / favorites / missing).
+- **Albums and playlists are editable**: rename, add songs (with a picker), remove songs, delete. Playlists can be reordered. Every album and playlist page has **Play** and **Shuffle**.
+- **Song page**: cover, duration, format, sample rate, channels, size, date added, playlists, file path, source link, and editable title / artist / album.
+- Clicking a song's **thumbnail** (or the cover/title in the bottom bar) plays it and opens Now Playing.
+- Missing files are flagged instead of breaking anything.
 
-### Queue
+### Spatial sound
 
-Hover a song in the queue to get up, down and remove buttons, or drag it by its handle to reorder.
+Switch from the headphone icon beside Shuffle on Now Playing (or in the bottom bar, or Settings):
 
-### Sleep timer
+- **Off**: plain stereo.
+- **Wide**: a much wider stage, opens up near-mono recordings, with a little crossfeed to stay comfortable.
+- **Room**: two virtual speakers in a room, with reflections and reverb.
+- **Orbit**: the sound circles your head about every 10 seconds.
 
-The moon button in the bottom bar starts a timer (15–90 min). The volume fades out gradually over the length set in Settings, then playback stops. The timer is based on the clock, not on counting ticks.
-
-### Keep awake
-
-"Keep Mac awake while playing" holds an IOKit power assertion (`PreventUserIdleSystemSleep`) only while audio is playing. It is released on pause, stop, quitting, or turning the setting off. It does not keep the display awake.
-
-### Spatial audio
-
-Four modes, switchable from the headphone icon beside Shuffle on Now Playing, the headphone button in the bottom bar, or Settings, each with an intensity slider:
-
-- **Off:** plain stereo.
-- **Wide:** a much wider stage (it opens up even near-mono recordings), with a little crossfeed so it stays comfortable.
-- **Room:** two virtual speakers in a room, with early reflections and reverb.
-- **Orbit:** the sound circles your head about once every 10 seconds.
-
-This is FocusFlow's own lightweight processing (interaural delay and level, head-shadow filtering, reflections, reverb), not measured-HRTF binaural rendering. It works with any stereo headphones, wired or Bluetooth. It cannot work when the output is **mono**: a Bluetooth headset switches to mono "call mode" when something is using its microphone. FocusFlow warns you when that happens; pick the stereo output in System Settings → Sound. AirPods also have system Spatial Audio in Control Center; apps cannot toggle that, so keep this Off if you use it.
+This is FocusFlow's own lightweight processing (interaural delay and level, head-shadow filtering, reflections, reverb), not measured-HRTF binaural rendering. It works with any stereo headphones, wired or Bluetooth. It can't work on a **mono** output: a Bluetooth headset drops to mono "call mode" when something uses its microphone, and FocusFlow warns you when that happens. AirPods also have system Spatial Audio in Control Center, which apps can't switch on; keep this Off if you use it.
 
 ### Earbuds, Bluetooth and media keys
 
-FocusFlow registers with macOS as a Now Playing app, so the Mac's media keys, AirPods and earbud buttons, Bluetooth headsets and Control Center control it: play/pause (from the earbud stem or button), next, previous and scrubbing. Play/pause is handled directly by the audio engine, so it works even when the window is hidden. Because it announces itself as the active player, these buttons no longer go to a paused video in your browser. If you disconnect the headphones that were playing, FocusFlow pauses instead of switching to the speakers.
+FocusFlow publishes what's playing to macOS (title, artist, cover, position) and handles play/pause, next, previous and scrubbing from AirPods and earbuds, Bluetooth headsets, keyboard media keys and Control Center. Play/pause is applied directly by the audio engine, so it works even when the window is hidden. If the headphones that were playing disconnect, FocusFlow **pauses** instead of blasting the speakers.
 
-## Known limitations (please read)
+### Sleep timer and power
 
-- **Playback can be interrupted by things the app cannot control:** system sleep (manual, or closing the lid on battery), a flat battery, shutdown or restart, macOS updates, and some audio device changes. Keep-awake only prevents *idle* sleep. When the output device changes (e.g. earbuds connected) FocusFlow follows the new default device and resumes the track, but a brief gap is possible.
-- **Long-run reliability has not been proven on real hardware.** The automated tests cover logic and short real-device runs only. Run the checklist in `MANUAL_TEST_CHECKLIST.md` (30-minute, multi-hour and 24-hour tests) before relying on it.
-- Resampling uses linear interpolation; if your files are 44.1 kHz and the device runs at 48 kHz, audio is very slightly less pristine than a high-order resampler. Seeking in some VBR MP3s may land a few tens of milliseconds off.
-- Tracks are not loudness-normalized, so different sources may differ in volume.
-- No mini-player window yet. (There is no "24 hour session" mode any more: it was removed on request. Playback simply loops the queue until you stop it or the sleep timer ends it.) The menu-bar controls, keyboard shortcuts and DMG are included.
-- Link import depends on third-party tools and on the site; it can break when the site changes.
-- Release builds are unsigned.
+- **Sleep timer** (moon button, 15–90 min): the volume fades out gradually, then playback stops.
+- **Keep Mac awake while playing** holds an IOKit assertion (`PreventUserIdleSystemSleep`) only while audio plays and releases it on pause, quit or when you turn it off. It does not keep the display awake.
+- Closing the window **hides it to the menu bar** and the music keeps playing; the menu-bar icon has Play/Pause, Previous, Next and Quit.
+
+## Keyboard shortcuts
+
+| Key | Action | Key | Action |
+|---|---|---|---|
+| `Space` | Play / pause | `M` | Mute |
+| `←` / `→` | Seek −10 s / +10 s | `S` | Shuffle |
+| `⌘←` / `⌘→` | Previous / next | `R` | Cycle repeat |
+| `↑` / `↓` | Volume | `F` | Favorite current song |
+
+## Efficiency
+
+FocusFlow is deliberately quiet on your CPU and battery: no animations, static scenes, a decoder that works in short bursts, and progress updates only twice a second (every few seconds when the window is hidden). `scripts/bench.sh` measures it.
+
+Measured on an M2 MacBook Air, plugged in, window in front:
+
+| Scenario | CPU (% of one core) | RAM |
+|---|---|---|
+| Paused | under 1% | ~220 MB |
+| Playing | **2–5%** (≈ 0.3–0.6% of the whole chip) | 250–290 MB |
+| Playing, window hidden to menu bar | **~2%** | ~250 MB |
+| *An earlier build with animations* | *12–64%* | *270–380 MB* |
+
+Run-to-run noise is large, so treat these as ranges. **Real battery drain has not been measured yet** (the Mac was plugged in); the unplugged test is in [`MANUAL_TEST_CHECKLIST.md`](MANUAL_TEST_CHECKLIST.md).
+
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph UI["React + TypeScript (webview)"]
+        V[Views] --> P[Player controller]
+        P --> Q[Pure logic: queue · shuffle · timers]
+    end
+    subgraph Rust["Rust (Tauri 2)"]
+        E[Audio engine<br/>symphonia → mixer → cpal]
+        L[(SQLite library<br/>tracks · albums · playlists)]
+        M[macOS Now Playing<br/>media keys · earbuds]
+        Y[Link import<br/>yt-dlp + ffmpeg]
+        K[Keep-awake · tray]
+    end
+    P <-- "commands & events" --> E
+    P <--> L
+    M -- "play / pause / next" --> E
+    M -. "next / previous" .-> P
+    Y --> L
+    E --> D[(Output device)]
+```
+
+The Rust engine owns playback: it decodes on background threads into small ring buffers, mixes in the audio callback, starts crossfades, promotes the preloaded next track and follows output-device changes (re-opening the track if the sample rate changes). The UI sends commands and receives events.
+
+```
+src/                      React + TypeScript interface
+  lib/queue.ts            queue, shuffle, repeat       (pure, tested)
+  lib/timers.ts           sleep timer                  (pure, tested)
+  lib/transition.ts       engine-event decisions       (pure, tested)
+  lib/player.ts           controller: engine, library, persistence
+  views/  components/     screens and UI parts
+  themes.ts               generated landscapes
+src-tauri/src/
+  audio.rs                decoder threads, mixer, crossfade, device handling
+  dsp.rs                  spatial sound modes
+  library.rs              SQLite library, albums, playlists, artwork, import
+  ytdl.rs                 link import, chapter / tracklist / silence splitting
+  media.rs                macOS Now Playing and remote commands
+  awake.rs                keep-awake power assertion
+  lib.rs                  Tauri commands, menu-bar icon, window behaviour
+scripts/                  selftest.sh · bench.sh · screenshots.sh
+```
+
+## Testing and honest status
+
+```bash
+npm test                          # 24 frontend tests: queue, shuffle/repeat, timers, transitions
+cd src-tauri && cargo test --lib  # 32 backend tests: engine, library, sound modes, link splitting, keep-awake
+./scripts/selftest.sh             # drives the built app end to end: 40 checks, plays quietly for ~1 minute
+./scripts/bench.sh                # CPU / energy measurements
+```
+
+All of these pass. Three more engine tests run against real audio files and your real output device (`cargo test --lib -- --ignored`). The full breakdown, and exactly what was *not* verified, is in [`TEST_REPORT.md`](TEST_REPORT.md).
+
+**Not verified yet** (it's a v0.1 personal project, so please be sceptical):
+
+- Long runs: 30-minute, multi-hour and 24-hour playback, memory over time.
+- macOS sleep/wake, device hot-swapping, and **real earbud / Bluetooth button presses**.
+- Link import against real videos (the detection is tested on synthetic data and a local ffmpeg-built file).
+- Real battery drain (unplugged).
+
+Step-by-step manual tests for all of these are in [`MANUAL_TEST_CHECKLIST.md`](MANUAL_TEST_CHECKLIST.md).
+
+## Known limitations
+
+- Playback can be interrupted by things no app controls: manual sleep, closing the lid on battery, a flat battery, shutdown, macOS updates, and some audio-device changes. Keep-awake only prevents *idle* sleep.
+- Resampling is linear interpolation (very slightly less pristine than a high-order resampler when a 44.1 kHz file plays on a 48 kHz device). Seeking in some VBR MP3s can land a few tens of milliseconds off.
+- Tracks aren't loudness-normalized, so different sources can differ in volume.
+- No mini-player window. Release builds are unsigned.
+- Link import depends on `yt-dlp` and on the site, and can break when the site changes.
 
 ## Troubleshooting
 
-- **"Audio engine unavailable":** no output device was found at launch. Connect/select one in System Settings → Sound and relaunch.
-- **A track is skipped with an error toast:** open Settings → Status to see the error log. Missing files are flagged in the Library ("File missing"); restore them and press Rescan.
-- **Link import says tools are missing:** `brew install yt-dlp ffmpeg`. GUI apps do not see your shell PATH, so FocusFlow looks in `/opt/homebrew/bin` and `/usr/local/bin`.
-- **App won't open from the DMG ("unidentified developer"):** right-click → Open once.
-- **Where is my data?** Library, playlists and favorites: `~/Library/Application Support/com.focusflow.app/library.db`. Settings and playback state are small JSON files in the same folder. Music: `~/Music/FocusFlow` (changeable).
+- **"Audio engine unavailable"**: no output device was found at launch. Choose one in System Settings → Sound and relaunch.
+- **A song is skipped with an error toast**: Settings → Status shows the error log. Missing files are flagged in Songs; restore them and press **Rescan**.
+- **Link import says tools are missing**: `brew install yt-dlp ffmpeg`. GUI apps don't see your shell's PATH, so FocusFlow looks in `/opt/homebrew/bin` and `/usr/local/bin`.
+- **Earbud buttons still control something else**: start playback in FocusFlow once (it then becomes the active player), and check Control Center → Now Playing shows FocusFlow.
+- **Spatial effects sound like nothing**: make sure the output is stereo (not a Bluetooth headset in call mode) and raise the intensity.
+- **"Unidentified developer"**: right-click the app → Open, once.
+- **Where is my data?** `~/Library/Application Support/com.focusflow.app/` (library database and small JSON settings files). Music lives in `~/Music/FocusFlow` unless you changed it.
 
-## Project layout
+## Contributing / regenerating screenshots
 
-```
-src/                 React + TypeScript interface
-  lib/queue.ts       queue, shuffle, repeat (pure, tested)
-  lib/timers.ts      sleep timer (pure, tested)
-  lib/transition.ts  engine-event decisions (pure, tested)
-  lib/player.ts      controller: engine, library, persistence, timers
-src-tauri/src/
-  audio.rs           decoding threads, mixer, crossfade, output device handling
-  dsp.rs             spatializer
-  library.rs         SQLite library, playlists, favorites, error log, import
-  ytdl.rs            link import and chapter splitting
-  awake.rs           keep-awake power assertion
-  lib.rs             Tauri commands, tray, window behaviour
+The screenshots come from the real interface running with demo data (`src/dev/mock.ts`). To regenerate them (needs Google Chrome):
+
+```bash
+./scripts/screenshots.sh
 ```
 
-Track transitions (preload, crossfade start, promotion to the next track) are done by the Rust engine, so they do not depend on webview timers.
+## Legal
+
+FocusFlow contains no music and no third-party artwork; every cover and landscape is generated. It is a tool for playing audio you are entitled to use. The link-import feature drives the separately installed `yt-dlp` and `ffmpeg`; you are responsible for complying with the terms of any site you use it with and with copyright law. No license has been chosen for this repository yet.
