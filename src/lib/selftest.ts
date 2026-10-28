@@ -125,6 +125,7 @@ export async function maybeRunSelfTest(): Promise<void> {
 
   await step("themes and song editing", async () => {
     await player.setSettings({ theme: "forest" });
+    await sleep(400); // settings are written in the background
     check("theme can be changed and is saved", st().settings.theme === "forest" && (await api.load<{ theme: string }>("settings"))?.theme === "forest");
     await player.setSettings({ theme: "stargazing" });
     const id = ids()[0];
@@ -133,6 +134,39 @@ export async function maybeRunSelfTest(): Promise<void> {
     const before = st().queue.items.slice();
     player.moveInQueue(0, 2);
     check("queue items can be reordered", JSON.stringify(st().queue.items) !== JSON.stringify(before) && st().queue.items.length === before.length);
+  });
+
+  await step("loudness analysis", async () => {
+    await api.analyzePending();
+    let measured = false;
+    const end = Date.now() + 40_000;
+    while (Date.now() < end) {
+      await player.reloadLibrary();
+      if (st().tracks.filter((t) => !t.missing).every((t) => t.gainDb !== null)) { measured = true; break; }
+      await sleep(500);
+    }
+    const ts = st().tracks.filter((t) => !t.missing);
+    check("every track is measured in the background", measured, ts.map((t) => `${t.title}:${t.lufs?.toFixed(1)}/${t.gainDb?.toFixed(1)}`).join(" "));
+    check("gains are sensible (within the allowed range)", ts.every((t) => (t.gainDb ?? 0) >= -14 && (t.gainDb ?? 0) <= 9));
+    await player.setSettings({ normalize: false });
+    await sleep(200);
+    check("normalisation can be switched off while playing", st().status === "playing" && !st().settings.normalize);
+    await player.setSettings({ normalize: true });
+  });
+
+  await step("mini player", async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    let ack: string | null = null;
+    const un = await listen<{ title: string }>("mini-ack", (e) => { ack = e.payload.title; });
+    await api.miniOpen();
+    check("the mini-player window opens", await api.miniExists());
+    const want = player.track(cur())?.title;
+    await waitFor(() => ack !== null, 8000);
+    check("the mini player receives the current song", ack === want, `got ${ack}, wanted ${want}`);
+    await api.miniClose();
+    await sleep(500);
+    check("the mini-player window closes (and stops costing anything)", !(await api.miniExists()));
+    un();
   });
 
   await step("now playing registration", async () => {

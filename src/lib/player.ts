@@ -1,10 +1,13 @@
 import { useSyncExternalStore } from "react";
+import { emit, listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { api, onEngine, onMedia, onTray, onYtProgress, type MediaAction, type YtProgress } from "./api";
+import { api, onAnalysis, onEngine, onMedia, onTray, onYtProgress, type MediaAction, type ToolStatus, type YtProgress } from "./api";
 import { advance, createQueue, currentId, emptyQueue, enqueue, jumpTo, move, previous, removeAt, removeId, setRepeat, setShuffle, type QueueState } from "./queue";
 import { decideTrackChanged } from "./transition";
 import { THEME_BY_ID } from "../themes";
+import { artUrl } from "./viz";
 import { startSleep, tickSleep, type SleepTimer } from "./timers";
 import { DEFAULT_SETTINGS, type EngineEvent, type ErrorLogEntry, type Playlist, type Repeat, type Settings, type Track } from "./types";
 
@@ -34,12 +37,15 @@ export interface PlayerState {
   engineError: string | null;
   device: string;
   libraryDir: string;
-  tools: { ytdlp: string | null; ffmpeg: string | null } | null;
+  tools: ToolStatus | null;
+  ytUpdating: boolean;
   awakeActive: boolean;
   importing: boolean;
   showImportLink: boolean;
   fading: boolean;
   outputChannels: number;
+  /** Progress of the background loudness measurement, or null when idle. */
+  analysis: { done: number; total: number } | null;
 }
 
 const SKIP_FADE = 0.35;
@@ -66,11 +72,13 @@ class Player {
     device: "",
     libraryDir: "",
     tools: null,
+    ytUpdating: false,
     awakeActive: false,
     importing: false,
     showImportLink: false,
     fading: false,
     outputChannels: 2,
+    analysis: null,
   };
 
   private listeners = new Set<() => void>();
@@ -88,6 +96,9 @@ class Player {
   private awakeWanted = false;
   private inited = false;
   private mediaKey = "";
+  private miniKey = "";
+  private miniOpen = false;
+  private trayTitle: string | null = null;
   private lastStatus: Status = "idle";
 
   // ---------------------------------------------------------------- store plumbing
@@ -115,9 +126,42 @@ class Player {
       this.syncAwake();
     }
     this.syncMedia();
+    this.syncMini();
   }
 
   /** Keeps macOS Now Playing (media keys, earbuds, Control Center) in step with what is playing. */
+  /** Tells the mini-player window (if open) what is playing, and updates the menu-bar title. */
+  private syncMini(force = false) {
+    const cur = this.track(currentId(this.s.queue));
+    // Menu-bar title
+    const title = this.s.settings.menuBarTitle && this.s.status === "playing" && cur ? `♪ ${[cur.title, cur.artist].filter(Boolean).join(" — ")}`.slice(0, 42) : null;
+    if (title !== this.trayTitle) {
+      this.trayTitle = title;
+      void api.setTrayTitle(title).catch(() => {});
+    }
+    if (!this.miniOpen && !force) return;
+    const key = `${cur?.id}|${cur?.favorite}|${cur?.title}|${this.s.settings.theme}`;
+    if (!force && key === this.miniKey) return;
+    this.miniKey = key;
+    void (async () => {
+      this.miniOpen = await api.miniExists().catch(() => false);
+      if (!this.miniOpen) return;
+      const art = cur?.hasArt ? await artUrl(cur.id) : null;
+      void emit("mini-state", { id: cur?.id ?? null, path: cur?.path ?? null, title: cur?.title ?? "Nothing playing", artist: cur?.artist ?? "", album: cur?.album ?? "", favorite: !!cur?.favorite, art, theme: this.s.settings.theme });
+    })();
+  }
+
+  private async onMiniCommand(c: string) {
+    const cur = currentId(this.s.queue);
+    switch (c) {
+      case "toggle": await this.togglePlay(); break;
+      case "next": await this.next(); break;
+      case "prev": await this.prev(); break;
+      case "fav": if (cur !== null) await this.toggleFavorite(cur); break;
+      case "open": { const w = getCurrentWindow(); await w.show(); await w.unminimize(); await w.setFocus(); break; }
+    }
+  }
+
   private syncMedia(force = false) {
     const cur = currentId(this.s.queue);
     const playing = this.s.status === "playing";
@@ -164,6 +208,9 @@ class Player {
     await onTray((a) => this.onTray(a));
     await onYtProgress((p) => this.onYt(p));
     await onMedia((a) => this.onMediaAction(a));
+    await onAnalysis((p) => void this.onAnalysisEvent(p));
+    await listen<string>("mini-cmd", (e) => void this.onMiniCommand(e.payload));
+    await listen("mini-hello", () => { this.miniOpen = true; this.syncMini(true); });
     try {
       await getCurrentWebview().onDragDropEvent((ev) => {
         if (ev.payload.type === "drop" && ev.payload.paths.length) void this.importPaths(ev.payload.paths);
@@ -181,6 +228,7 @@ class Player {
     await api.refreshMissing().catch(() => 0);
     await this.reloadLibrary();
     await this.pushSettingsToEngine();
+    void api.analyzePending().catch(() => {}); // measure loudness of anything new, in the background
 
     const pb = await api.load<PlaybackSave>("playback").catch(() => null);
     if (pb && settings.resumeOnLaunch) this.restorePlayback(pb);
@@ -221,6 +269,7 @@ class Player {
     try {
       const r = await api.importPaths(paths);
       await this.reloadLibrary();
+      void api.analyzePending().catch(() => {});
       this.badIds.clear();
       const parts = [`${r.added.length} added`];
       if (r.duplicates) parts.push(`${r.duplicates} duplicate${r.duplicates > 1 ? "s" : ""} skipped`);
@@ -248,6 +297,7 @@ class Player {
       await api.refreshMissing();
       const r = await api.scan();
       await this.reloadLibrary();
+      void api.analyzePending().catch(() => {});
       this.badIds.clear();
       this.toast("ok", `Library scanned: ${r.added.length} new, ${this.s.tracks.filter((t) => t.missing).length} missing.`);
     } catch (e) {
@@ -410,7 +460,7 @@ class Player {
       if (token !== this.playToken) return; // a newer request supersedes this one
       try {
         if (t.missing) throw new Error("file is missing");
-        const info = await api.enginePlay(t.path, start, this.s.status === "playing" || this.s.engineLoaded ? fade : 0.02, t.duration);
+        const info = await api.enginePlay(t.path, start, this.s.status === "playing" || this.s.engineLoaded ? fade : 0.02, t.duration, t.gainDb ?? 0);
         this.seenSerial = Math.max(this.seenSerial, info.serial - 1);
         if (token === this.playToken) this.pendingPlayPath = null;
         this.set({ status: "playing", engineLoaded: true, position: start, duration: info.duration || t.duration, fading: false });
@@ -528,11 +578,11 @@ class Player {
       const t = step.id !== null ? this.byId.get(step.id) : undefined;
       if (!t || step.id === null) {
         this.preview = null;
-        await api.engineSetNext(null, 0).catch(() => {});
+        await api.engineSetNext(null, 0, 0).catch(() => {});
         return;
       }
       try {
-        await api.engineSetNext(t.path, t.duration);
+        await api.engineSetNext(t.path, t.duration, t.gainDb ?? 0);
         if (token !== this.nextToken) return;
         this.preview = { id: step.id, queue: step.queue, path: t.path };
         return;
@@ -613,6 +663,12 @@ class Player {
         if (ev.preload) void this.refreshNext();
         break;
       }
+      case "woke": {
+        const mins = ev.sleptSecs >= 90 ? `${Math.round(ev.sleptSecs / 60)} min` : `${Math.round(ev.sleptSecs)} s`;
+        if (!ev.resumed) this.set({ status: "paused" });
+        this.toast("info", ev.resumed ? `The Mac was asleep for ${mins}. Playback carried on.` : `The Mac was asleep for ${mins}. Paused (change this in Settings).`);
+        break;
+      }
       case "devicePaused":
         this.set({ status: "paused" });
         this.toast("info", "Paused because the audio device was disconnected.");
@@ -644,6 +700,16 @@ class Player {
       case "next": void this.next(); break;
       case "previous": void this.prev(); break;
       case "stop": void this.stop(); break;
+    }
+  }
+
+  private async onAnalysisEvent(p: { done: number; total: number } | "done") {
+    if (p === "done") {
+      this.set({ analysis: null });
+      await this.reloadLibrary(); // pick up the new gains
+      void this.refreshNext(); // the preloaded next track may now have a gain
+    } else {
+      this.set({ analysis: p });
     }
   }
 
@@ -696,6 +762,8 @@ class Player {
       api.engineSetCrossfade(s.crossfadeSecs),
       api.engineSetSpatial(s.spatialMode, s.spatialAmount),
       api.setHideOnClose(s.hideOnClose),
+      api.engineSetResumeAfterWake(s.resumeAfterWake),
+      api.engineSetNormalize(s.normalize),
     ]);
     this.set({ queue: setRepeat(setShuffle(this.s.queue, s.shuffle), s.repeat) });
   }
@@ -709,6 +777,8 @@ class Player {
     if ("crossfadeSecs" in patch) void api.engineSetCrossfade(settings.crossfadeSecs);
     if ("spatialMode" in patch || "spatialAmount" in patch) void api.engineSetSpatial(settings.spatialMode, settings.spatialAmount);
     if ("hideOnClose" in patch) void api.setHideOnClose(settings.hideOnClose);
+    if ("normalize" in patch) void api.engineSetNormalize(settings.normalize);
+    if ("resumeAfterWake" in patch) void api.engineSetResumeAfterWake(settings.resumeAfterWake);
     if ("keepAwake" in patch) this.syncAwake();
     if ("shuffle" in patch) {
       this.set({ queue: setShuffle(this.s.queue, settings.shuffle) });
@@ -812,8 +882,20 @@ class Player {
       this.toast("ok", `${added.length} tracks added to your library.`);
     }
     await this.reloadLibrary();
+    void api.analyzePending().catch(() => {});
     if (this.s.queue.items.length === 0 && this.s.tracks.length) {
       this.set({ queue: createQueue(this.s.tracks.map((t) => t.id), 0, this.s.settings.shuffle, this.s.settings.repeat) });
+    }
+  }
+  /** Upgrades yt-dlp with Homebrew; only runs when the user presses the button. */
+  async updateYtdlp() {
+    this.set({ ytUpdating: true });
+    try {
+      this.toast("ok", await api.ytUpdate());
+    } catch (e) {
+      this.toast("error", String(e));
+    } finally {
+      this.set({ ytUpdating: false, tools: await api.ytTools().catch(() => this.s.tools) });
     }
   }
   clearJobs() { this.set({ ytJobs: this.s.ytJobs.filter((j) => j.status === "running" || j.status === "queued") }); }

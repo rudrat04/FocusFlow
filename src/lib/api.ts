@@ -4,13 +4,15 @@ import type { EngineEvent, ErrorLogEntry, ImportReport, Playlist, Track } from "
 
 export interface PlayInfo { serial: number; duration: number }
 export interface Paths { libraryDir: string; dataDir: string }
-export interface ToolStatus { ytdlp: string | null; ffmpeg: string | null }
+export interface ToolStatus { ytdlp: string | null; ffmpeg: string | null; ytdlpAgeDays: number | null; ytdlpOutdated: boolean; canUpdate: boolean }
 export interface YtProgress { url: string; stage: string; percent: number | null; message: string }
 
 export const api = {
-  enginePlay: (path: string, start: number, fadeSecs: number, durationHint: number) =>
-    invoke<PlayInfo>("engine_play", { path, start, fadeSecs, durationHint }),
-  engineSetNext: (path: string | null, durationHint: number) => invoke<void>("engine_set_next", { path, durationHint }),
+  enginePlay: (path: string, start: number, fadeSecs: number, durationHint: number, gainDb: number) =>
+    invoke<PlayInfo>("engine_play", { path, start, fadeSecs, durationHint, gainDb }),
+  engineSetNext: (path: string | null, durationHint: number, gainDb: number) => invoke<void>("engine_set_next", { path, durationHint, gainDb }),
+  engineSetNormalize: (on: boolean) => invoke<void>("engine_set_normalize", { on }),
+  analyzePending: () => invoke<void>("lib_analyze_pending"),
   enginePause: () => invoke<void>("engine_pause"),
   engineResume: () => invoke<void>("engine_resume"),
   engineStop: () => invoke<void>("engine_stop"),
@@ -20,7 +22,13 @@ export const api = {
   engineSetSpatial: (mode: string, amount: number) => invoke<void>("engine_set_spatial", { mode, amount }),
   engineFadeOut: (secs: number) => invoke<void>("engine_fade_out", { secs }),
   engineCancelFade: () => invoke<void>("engine_cancel_fade"),
-  engineSetUiActive: (active: boolean) => invoke<void>("engine_set_ui_active", { active }),
+  engineSetResumeAfterWake: (on: boolean) => invoke<void>("engine_set_resume_after_wake", { on }),
+  engineSetUiActive: (window: string, active: boolean) => invoke<void>("engine_set_ui_active", { window, active }),
+  miniOpen: () => invoke<void>("mini_open"),
+  miniClose: () => invoke<void>("mini_close"),
+  miniExists: () => invoke<boolean>("mini_exists"),
+  miniSetPinned: (pinned: boolean) => invoke<void>("mini_set_pinned", { pinned }),
+  setTrayTitle: (title: string | null) => invoke<void>("set_tray_title", { title }),
   engineStatus: () => invoke<{ available: boolean; error: string | null; device: string; channels: number }>("engine_status"),
   mediaSetNowPlaying: (trackId: number | null, playing: boolean, loaded: boolean, position: number) => invoke<void>("media_set_now_playing", { trackId, playing, loaded, position }),
 
@@ -56,6 +64,7 @@ export const api = {
   selftestWrite: (out: string, text: string) => invoke<void>("selftest_write", { out, text }),
   selftestRemove: (path: string) => invoke<void>("selftest_remove", { path }),
   ytTools: () => invoke<ToolStatus>("yt_tools"),
+  ytUpdate: () => invoke<string>("yt_update"),
   ytImport: (url: string, manualChapters: string | null, autoSplit: boolean) => invoke<number[]>("yt_import", { url, manualChapters, autoSplit }),
   updateTrack: (id: number, title: string, artist: string, album: string) => invoke<void>("lib_update_track", { id, title, artist, album }),
 };
@@ -73,4 +82,11 @@ export function onYtProgress(cb: (p: YtProgress) => void): Promise<UnlistenFn> {
 export type MediaAction = { action: "state"; playing: boolean } | { action: "play" | "toggle" | "next" | "previous" | "stop" };
 export function onMedia(cb: (a: MediaAction) => void): Promise<UnlistenFn> {
   return listen<MediaAction>("media", (e) => cb(e.payload));
+}
+
+export function onAnalysis(cb: (p: { done: number; total: number } | "done") => void): Promise<UnlistenFn[]> {
+  return Promise.all([
+    listen<{ done: number; total: number }>("analysis", (e) => cb(e.payload)),
+    listen<number>("analysis-done", () => cb("done")),
+  ]);
 }

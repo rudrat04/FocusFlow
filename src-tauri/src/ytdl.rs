@@ -5,6 +5,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -24,6 +25,43 @@ pub struct Progress {
 pub struct ToolStatus {
     pub ytdlp: Option<String>,
     pub ffmpeg: Option<String>,
+    /// How many days old this yt-dlp release is (its version is its release date).
+    pub ytdlp_age_days: Option<i64>,
+    /// Old enough that downloads are likely to break; a one-click update is offered.
+    pub ytdlp_outdated: bool,
+    /// yt-dlp was installed with Homebrew, so FocusFlow can update it for you.
+    pub can_update: bool,
+}
+
+/// yt-dlp downloads start failing when YouTube changes; releases older than this are flagged.
+const OUTDATED_AFTER_DAYS: i64 = 45;
+
+/// Days since 1970-01-01 for a calendar date (proleptic Gregorian).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Age in days of a yt-dlp version such as "2026.10.26" (a trailing ".1" revision is ignored).
+pub fn version_age_days(version: &str, today_days_since_epoch: i64) -> Option<i64> {
+    let mut it = version.trim().split('.');
+    let (y, m, d): (i64, i64, i64) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+    if !(2000..2200).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(today_days_since_epoch - days_from_civil(y, m, d))
+}
+
+fn today_days() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64 / 86_400).unwrap_or(0)
+}
+
+fn brew_path() -> Option<PathBuf> {
+    ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].iter().map(PathBuf::from).find(|p| p.exists())
 }
 
 const SEARCH_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/opt/local/bin"];
@@ -53,7 +91,27 @@ pub fn tool_status() -> ToolStatus {
         let s = String::from_utf8_lossy(&out.stdout);
         Some(s.lines().next().unwrap_or("").trim().to_string())
     };
-    ToolStatus { ytdlp: version("yt-dlp", "--version"), ffmpeg: version("ffmpeg", "-version") }
+    let ytdlp = version("yt-dlp", "--version");
+    let age = ytdlp.as_deref().and_then(|v| version_age_days(v, today_days()));
+    let installed_by_brew = find_tool("yt-dlp").map(|p| p.starts_with("/opt/homebrew") || p.starts_with("/usr/local")).unwrap_or(false);
+    ToolStatus { ytdlp, ffmpeg: version("ffmpeg", "-version"), ytdlp_age_days: age, ytdlp_outdated: age.map(|a| a > OUTDATED_AFTER_DAYS).unwrap_or(false), can_update: installed_by_brew && brew_path().is_some() }
+}
+
+/// Upgrades yt-dlp with Homebrew. Only called when the user presses the button.
+pub fn update_ytdlp() -> Result<String, String> {
+    let brew = brew_path().ok_or("Homebrew was not found, so FocusFlow can't update yt-dlp for you. Run: brew upgrade yt-dlp")?;
+    let out = Command::new(brew)
+        .args(["upgrade", "yt-dlp"])
+        .env("PATH", tool_path_env())
+        .env("HOMEBREW_NO_ENV_HINTS", "1")
+        .output()
+        .map_err(|e| format!("could not start Homebrew: {e}"))?;
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    if !out.status.success() {
+        let line = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("brew failed");
+        return Err(format!("Update failed: {line}"));
+    }
+    Ok(if text.contains("already installed") || text.trim().is_empty() { "yt-dlp is already up to date.".into() } else { "yt-dlp was updated.".into() })
 }
 
 pub fn sanitize(name: &str) -> String {
@@ -252,20 +310,108 @@ struct Tools {
 
 type Report<'a> = &'a dyn Fn(&str, Option<f32>, &str);
 
-fn ytdlp_json(tools: &Tools, args: &[&str], url: &str) -> Result<serde_json::Value, String> {
-    let out = Command::new(&tools.ytdlp).args(args).arg(url).env("PATH", &tools.path_env).output().map_err(|e| format!("could not start yt-dlp: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let line = err.lines().rev().find(|l| l.contains("ERROR")).unwrap_or("yt-dlp failed");
-        return Err(format!("{line} (if this persists, run: brew upgrade yt-dlp)"));
-    }
-    serde_json::from_slice(&out.stdout).map_err(|e| format!("unreadable video info: {e}"))
+// ---------------------------------------------------------------- failures and retries
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// Private, removed or region-blocked.
+    Unavailable,
+    /// YouTube wants a sign-in (age check or bot check).
+    SignIn,
+    /// A network hiccup: worth retrying.
+    Network,
+    /// Rate limiting or a blocked request (HTTP 403/429).
+    Blocked,
+    /// yt-dlp cannot read YouTube's current page: usually an out-of-date yt-dlp.
+    Outdated,
+    Other,
 }
 
-/// Runs a download, feeding percentages to `on_line`. Returns stderr text on failure.
-fn run_download(mut cmd: Command, mut on_line: impl FnMut(&str)) -> Result<(), String> {
+pub fn classify(stderr: &str) -> Failure {
+    let t = stderr.to_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| t.contains(n));
+    if has(&["sign in to confirm", "confirm you’re not a bot", "confirm you're not a bot", "age-restricted", "login required", "this video requires login"]) {
+        Failure::SignIn
+    } else if has(&["video unavailable", "private video", "has been removed", "this video is not available", "no longer available", "has been terminated", "members-only", "not available in your country", "blocked it in your country"]) {
+        Failure::Unavailable
+    } else if has(&["unable to extract", "nsig extraction failed", "signature extraction failed", "player response", "unsupported url", "requested format is not available"]) {
+        Failure::Outdated
+    } else if has(&["http error 403", "http error 429", "too many requests"]) {
+        Failure::Blocked
+    } else if has(&["timed out", "temporary failure in name resolution", "connection reset", "connection refused", "network is unreachable", "urlopen error", "remote end closed", "http error 500", "http error 502", "http error 503", "http error 504", "nodename nor servname"]) {
+        Failure::Network
+    } else {
+        Failure::Other
+    }
+}
+
+/// A plain-English message for a failure (with yt-dlp's own last error line appended for the unknown kind).
+pub fn explain(kind: Failure, stderr: &str) -> String {
+    let last = stderr.lines().rev().find(|l| l.contains("ERROR")).unwrap_or("yt-dlp failed").trim();
+    match kind {
+        Failure::Unavailable => "That video isn't available: it may be private, removed, or blocked in your country.".into(),
+        Failure::SignIn => "YouTube is asking for a sign-in for this video (an age check or a bot check). FocusFlow doesn't use your account, so try a different link.".into(),
+        Failure::Network => "Network problem while downloading. Check your connection and try again.".into(),
+        Failure::Blocked => "YouTube is limiting or blocking this request (HTTP 403/429). Wait a few minutes and try again; updating yt-dlp can also help.".into(),
+        Failure::Outdated => "yt-dlp could not read YouTube's current page. This usually means yt-dlp is out of date: use “Update yt-dlp” and try again.".into(),
+        Failure::Other => format!("{last} (if this keeps happening, update yt-dlp)"),
+    }
+}
+
+/// Extra yt-dlp arguments for the second try after a blocked/outdated failure: ask YouTube for the
+/// page through different player clients. Unknown client names are ignored by yt-dlp.
+const ALTERNATE_CLIENTS: [&str; 2] = ["--extractor-args", "youtube:player_client=web_safari,android_vr,tv"];
+
+/// Runs `attempt` (given extra arguments) with a retry policy: network errors are retried up to
+/// twice after a pause; blocked/outdated failures get one retry through alternate clients; sign-in and
+/// unavailable failures are final. `note` reports what is happening; `pause` sleeps.
+pub fn with_retries<T>(
+    mut attempt: impl FnMut(&[&str]) -> Result<T, String>,
+    note: &dyn Fn(&str),
+    pause: &dyn Fn(Duration),
+) -> Result<T, String> {
+    let mut network_tries = 0;
+    let mut tried_alternate = false;
+    let mut extra: &[&str] = &[];
+    loop {
+        let err = match attempt(extra) {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        let kind = classify(&err);
+        match kind {
+            Failure::Network if network_tries < 2 => {
+                network_tries += 1;
+                note(&format!("Network problem, retrying ({network_tries} of 2)…"));
+                pause(Duration::from_secs(2 + 3 * network_tries as u64));
+            }
+            Failure::Outdated | Failure::Blocked if !tried_alternate => {
+                tried_alternate = true;
+                extra = &ALTERNATE_CLIENTS;
+                note("YouTube refused that request. Trying again another way…");
+                pause(Duration::from_secs(2));
+            }
+            _ => return Err(explain(kind, &err)),
+        }
+    }
+}
+
+fn run_ytdlp_json(tools: &Tools, args: &[&str], extra: &[&str], url: &str) -> Result<serde_json::Value, String> {
+    let out = Command::new(&tools.ytdlp).args(args).args(extra).arg(url).env("PATH", &tools.path_env).output().map_err(|e| format!("could not start yt-dlp: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("ERROR: unreadable video info: {e}"))
+}
+
+fn ytdlp_json(tools: &Tools, args: &[&str], url: &str, note: &dyn Fn(&str)) -> Result<serde_json::Value, String> {
+    with_retries(|extra| run_ytdlp_json(tools, args, extra, url), note, &std::thread::sleep)
+}
+
+/// One download attempt; returns yt-dlp's stderr text on failure so it can be classified.
+fn run_download_once(mut cmd: Command, on_line: &mut dyn FnMut(&str)) -> Result<(), String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("could not start yt-dlp: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("ERROR: could not start yt-dlp: {e}"))?;
     let stderr = child.stderr.take();
     let err_thread = std::thread::spawn(move || {
         let mut text = String::new();
@@ -285,10 +431,14 @@ fn run_download(mut cmd: Command, mut on_line: impl FnMut(&str)) -> Result<(), S
     let status = child.wait().map_err(|e| e.to_string())?;
     let errs = err_thread.join().unwrap_or_default();
     if !status.success() {
-        let line = errs.lines().rev().find(|l| l.contains("ERROR")).unwrap_or("download failed");
-        return Err(format!("{line} (if this persists, run: brew upgrade yt-dlp)"));
+        return Err(if errs.trim().is_empty() { "ERROR: download failed".into() } else { errs });
     }
     Ok(())
+}
+
+/// Runs a download with retries. `make` builds the command, given any extra arguments for this attempt.
+fn run_download(make: &dyn Fn(&[&str]) -> Command, note: &dyn Fn(&str), mut on_line: impl FnMut(&str)) -> Result<(), String> {
+    with_retries(|extra| run_download_once(make(extra), &mut on_line), note, &std::thread::sleep)
 }
 
 fn percent_of(line: &str) -> Option<f32> {
@@ -297,7 +447,8 @@ fn percent_of(line: &str) -> Option<f32> {
 
 fn import_video(lib: &Library, library_dir: &Path, url: &str, opts: &Options, tools: &Tools, report: Report) -> Result<Vec<i64>, String> {
     report("info", None, "Reading video details…");
-    let info = ytdlp_json(tools, &["--no-playlist", "--skip-download", "--dump-single-json"], url)?;
+    let note = |m: &str| report("info", None, m);
+    let info = ytdlp_json(tools, &["--no-playlist", "--skip-download", "--dump-single-json"], url, &note)?;
     let title = info["title"].as_str().unwrap_or("Untitled").to_string();
     let id = info["id"].as_str().unwrap_or("video").to_string();
     let total = info["duration"].as_f64();
@@ -308,20 +459,24 @@ fn import_video(lib: &Library, library_dir: &Path, url: &str, opts: &Options, to
     let full = folder.join("full.mp3");
 
     report("download", Some(0.0), "Downloading audio…");
-    let mut cmd = Command::new(&tools.ytdlp);
-    cmd.args(["--no-playlist", "-x", "--audio-format", "mp3", "--audio-quality", "0", "--no-mtime", "--newline"])
-        .args(["--write-thumbnail", "--convert-thumbnails", "jpg"])
-        .arg("--ffmpeg-location")
-        .arg(&tools.ffmpeg)
-        .arg("-o")
-        .arg(folder.join("full.%(ext)s"))
-        .arg("-o")
-        .arg(format!("thumbnail:{}", folder.join("cover.%(ext)s").display()));
-    if has_chapters {
-        cmd.arg("--split-chapters").arg("-o").arg(format!("chapter:{}", folder.join("%(section_number)02d - %(section_title).120B.%(ext)s").display()));
-    }
-    cmd.arg(url).env("PATH", &tools.path_env);
-    run_download(cmd, |line| {
+    let make = |extra: &[&str]| {
+        let mut cmd = Command::new(&tools.ytdlp);
+        cmd.args(["--no-playlist", "-x", "--audio-format", "mp3", "--audio-quality", "0", "--no-mtime", "--newline"])
+            .args(["--write-thumbnail", "--convert-thumbnails", "jpg"])
+            .arg("--ffmpeg-location")
+            .arg(&tools.ffmpeg)
+            .arg("-o")
+            .arg(folder.join("full.%(ext)s"))
+            .arg("-o")
+            .arg(format!("thumbnail:{}", folder.join("cover.%(ext)s").display()))
+            .args(extra);
+        if has_chapters {
+            cmd.arg("--split-chapters").arg("-o").arg(format!("chapter:{}", folder.join("%(section_number)02d - %(section_title).120B.%(ext)s").display()));
+        }
+        cmd.arg(url).env("PATH", &tools.path_env);
+        cmd
+    };
+    run_download(&make, &|m| report("download", None, m), |line| {
         if let Some(p) = percent_of(line) {
             report("download", Some(p), "Downloading audio…");
         } else if line.contains("ExtractAudio") || line.contains("Destination") {
@@ -358,7 +513,7 @@ fn import_video(lib: &Library, library_dir: &Path, url: &str, opts: &Options, to
         if plan.is_none() && opts.auto_split {
             report("detect", None, "Checking the top comments for a track list…");
             let args = ["--no-playlist", "--skip-download", "--write-comments", "--dump-single-json", "--extractor-args", "youtube:max_comments=80,80,0,0,0;comment_sort=top"];
-            if let Ok(with_comments) = ytdlp_json(tools, &args, url) {
+            if let Ok(with_comments) = ytdlp_json(tools, &args, url, &|_| {}) {
                 plan = marks_from_comments(&with_comments, total).map(|m| (m, "a comment"));
             }
         }
@@ -408,7 +563,7 @@ fn import_video(lib: &Library, library_dir: &Path, url: &str, opts: &Options, to
 /// An album or playlist link (YouTube Music): each entry is downloaded as its own track.
 fn import_playlist(lib: &Library, library_dir: &Path, url: &str, tools: &Tools, report: Report) -> Result<Vec<i64>, String> {
     report("info", None, "Reading playlist…");
-    let info = ytdlp_json(tools, &["--flat-playlist", "--skip-download", "--dump-single-json"], url)?;
+    let info = ytdlp_json(tools, &["--flat-playlist", "--skip-download", "--dump-single-json"], url, &|m| report("info", None, m))?;
     let title = info["title"].as_str().unwrap_or("Playlist").trim_start_matches("Album - ").to_string();
     let id = info["id"].as_str().unwrap_or("playlist").to_string();
     let count = info["entries"].as_array().map(|e| e.len()).unwrap_or(0);
@@ -420,19 +575,23 @@ fn import_playlist(lib: &Library, library_dir: &Path, url: &str, tools: &Tools, 
     let template = folder.join("%(playlist_index)02d - %(title).120B.%(ext)s");
 
     report("download", Some(0.0), &format!("Downloading {count} tracks…"));
-    let mut cmd = Command::new(&tools.ytdlp);
-    cmd.args(["--yes-playlist", "--ignore-errors", "-x", "--audio-format", "mp3", "--audio-quality", "0", "--no-mtime", "--newline"])
-        .args(["--write-thumbnail", "--convert-thumbnails", "jpg"])
-        .arg("--ffmpeg-location")
-        .arg(&tools.ffmpeg)
-        .arg("-o")
-        .arg(&template)
-        .arg("-o")
-        .arg(format!("thumbnail:{}", template.display()))
-        .arg(url)
-        .env("PATH", &tools.path_env);
+    let make = |extra: &[&str]| {
+        let mut cmd = Command::new(&tools.ytdlp);
+        cmd.args(["--yes-playlist", "--ignore-errors", "-x", "--audio-format", "mp3", "--audio-quality", "0", "--no-mtime", "--newline"])
+            .args(["--write-thumbnail", "--convert-thumbnails", "jpg"])
+            .arg("--ffmpeg-location")
+            .arg(&tools.ffmpeg)
+            .arg("-o")
+            .arg(&template)
+            .arg("-o")
+            .arg(format!("thumbnail:{}", template.display()))
+            .args(extra)
+            .arg(url)
+            .env("PATH", &tools.path_env);
+        cmd
+    };
     let (mut item, mut total) = (1usize, count);
-    run_download(cmd, |line| {
+    run_download(&make, &|m| report("download", None, m), |line| {
         if let Some(rest) = line.strip_prefix("[download] Downloading item ") {
             let mut it = rest.split(" of ");
             if let (Some(a), Some(b)) = (it.next().and_then(|x| x.trim().parse().ok()), it.next().and_then(|x| x.trim().parse().ok())) {
@@ -585,5 +744,98 @@ mod tests {
         let durs: Vec<f64> = lib.list_tracks().unwrap().iter().map(|t| t.duration).collect();
         let sum: f64 = durs.iter().sum();
         assert!((sum - total).abs() < 12.0, "durations {durs:?}");
+    }
+
+    // ------------------------------------------------------------ health and retries
+
+    #[test]
+    fn yt_dlp_version_age_is_computed_from_its_date() {
+        let today = days_from_civil(2026, 10, 28);
+        assert_eq!(version_age_days("2026.10.26", today), Some(2));
+        assert_eq!(version_age_days("2026.09.01", today), Some(57));
+        assert_eq!(version_age_days("2025.10.28", today), Some(365));
+        assert_eq!(version_age_days("2026.10.26.1\n", today), Some(2), "a revision suffix and whitespace are fine");
+        assert_eq!(version_age_days("nightly", today), None);
+        assert_eq!(version_age_days("1999.01.01", today), None);
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 3, 1) - days_from_civil(2000, 2, 28), 2, "2000 was a leap year");
+    }
+
+    #[test]
+    fn real_error_text_is_classified() {
+        let cases = [
+            ("ERROR: [youtube] abc: Sign in to confirm you’re not a bot. Use --cookies-from-browser", Failure::SignIn),
+            ("ERROR: [youtube] abc: Sign in to confirm your age. This video may be inappropriate", Failure::SignIn),
+            ("ERROR: [youtube] abc: Video unavailable. This video is not available", Failure::Unavailable),
+            ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access", Failure::Unavailable),
+            ("ERROR: [youtube] abc: This video has been removed by the uploader", Failure::Unavailable),
+            ("ERROR: [youtube] abc: nsig extraction failed: Some formats may be missing", Failure::Outdated),
+            ("ERROR: Unable to extract initial player response; please report this issue", Failure::Outdated),
+            ("ERROR: unable to download video data: HTTP Error 403: Forbidden", Failure::Blocked),
+            ("ERROR: HTTP Error 429: Too Many Requests", Failure::Blocked),
+            ("ERROR: Unable to download webpage: <urlopen error [Errno 8] nodename nor servname provided, or not known>", Failure::Network),
+            ("ERROR: unable to download video data: The read operation timed out", Failure::Network),
+            ("ERROR: something nobody has seen before", Failure::Other),
+        ];
+        for (text, want) in cases {
+            assert_eq!(classify(text), want, "{text}");
+        }
+        assert!(explain(Failure::SignIn, "").contains("sign-in"));
+        assert!(explain(Failure::Outdated, "").contains("Update yt-dlp"));
+        assert!(explain(Failure::Other, "ERROR: weird thing").contains("ERROR: weird thing"));
+    }
+
+    #[test]
+    fn network_errors_are_retried_then_succeed() {
+        let calls = std::cell::Cell::new(0);
+        let pauses = std::cell::RefCell::new(Vec::new());
+        let notes = std::cell::RefCell::new(Vec::new());
+        let r = with_retries(
+            |extra| {
+                calls.set(calls.get() + 1);
+                assert!(extra.is_empty(), "network retries keep the same arguments");
+                if calls.get() < 3 { Err("ERROR: The read operation timed out".to_string()) } else { Ok("done") }
+            },
+            &|m| notes.borrow_mut().push(m.to_string()),
+            &|d| pauses.borrow_mut().push(d),
+        );
+        assert_eq!(r, Ok("done"));
+        assert_eq!(calls.get(), 3);
+        assert_eq!(pauses.borrow().len(), 2);
+        assert!(notes.borrow()[0].contains("retrying (1 of 2)"));
+    }
+
+    #[test]
+    fn persistent_network_failure_gives_up_with_a_friendly_message() {
+        let calls = std::cell::Cell::new(0);
+        let r: Result<(), String> = with_retries(|_| { calls.set(calls.get() + 1); Err("ERROR: connection reset by peer".into()) }, &|_| {}, &|_| {});
+        assert_eq!(calls.get(), 3, "one try plus two retries");
+        assert!(r.unwrap_err().starts_with("Network problem"));
+    }
+
+    #[test]
+    fn blocked_or_outdated_failures_retry_once_through_alternate_clients() {
+        let seen = std::cell::RefCell::new(Vec::<Vec<String>>::new());
+        let r: Result<(), String> = with_retries(
+            |extra| { seen.borrow_mut().push(extra.iter().map(|s| s.to_string()).collect()); Err("ERROR: nsig extraction failed".into()) },
+            &|_| {},
+            &|_| {},
+        );
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 2, "exactly one more attempt");
+        assert!(seen[0].is_empty());
+        assert_eq!(seen[1][0], "--extractor-args");
+        assert!(seen[1][1].starts_with("youtube:player_client="));
+        assert!(r.unwrap_err().contains("Update yt-dlp"), "after the retry the user is told to update");
+    }
+
+    #[test]
+    fn sign_in_and_unavailable_are_final_and_not_retried() {
+        for text in ["ERROR: Sign in to confirm you're not a bot", "ERROR: Video unavailable"] {
+            let calls = std::cell::Cell::new(0);
+            let r: Result<(), String> = with_retries(|_| { calls.set(calls.get() + 1); Err(text.to_string()) }, &|_| {}, &|_| panic!("must not wait"));
+            assert_eq!(calls.get(), 1, "{text}");
+            assert!(r.is_err());
+        }
     }
 }

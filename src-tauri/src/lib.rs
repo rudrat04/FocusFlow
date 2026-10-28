@@ -2,6 +2,7 @@ mod audio;
 mod awake;
 mod dsp;
 mod library;
+mod loudness;
 mod media;
 mod ytdl;
 
@@ -34,6 +35,8 @@ struct AppState {
     awake: Mutex<awake::KeepAwake>,
     media: Option<media::Media>,
     hide_on_close: AtomicBool,
+    analyzing: AtomicBool,
+    ui_mask: std::sync::atomic::AtomicU32,
 }
 
 impl AppState {
@@ -65,13 +68,13 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 // ------------------------------------------------------------------ engine
 
 #[tauri::command]
-async fn engine_play(state: State<'_, AppState>, path: String, start: f64, fade_secs: f32, duration_hint: f64) -> Res<PlayInfo> {
-    state.engine()?.play(&path, start, fade_secs, duration_hint)
+async fn engine_play(state: State<'_, AppState>, path: String, start: f64, fade_secs: f32, duration_hint: f64, gain_db: f64) -> Res<PlayInfo> {
+    state.engine()?.play(&path, start, fade_secs, duration_hint, gain_db)
 }
 
 #[tauri::command]
-async fn engine_set_next(state: State<'_, AppState>, path: Option<String>, duration_hint: f64) -> Res<()> {
-    state.engine()?.set_next(path.as_deref(), duration_hint)
+async fn engine_set_next(state: State<'_, AppState>, path: Option<String>, duration_hint: f64, gain_db: f64) -> Res<()> {
+    state.engine()?.set_next(path.as_deref(), duration_hint, gain_db)
 }
 
 #[tauri::command]
@@ -127,9 +130,24 @@ async fn engine_cancel_fade(state: State<'_, AppState>) -> Res<()> {
     Ok(())
 }
 
+/// Each window reports whether it is visible; the engine reports progress often while any is.
 #[tauri::command]
-async fn engine_set_ui_active(state: State<'_, AppState>, active: bool) -> Res<()> {
-    state.engine()?.set_ui_active(active);
+async fn engine_set_ui_active(state: State<'_, AppState>, window: String, active: bool) -> Res<()> {
+    let bit = if window == "mini" { 2 } else { 1 };
+    let mask = if active { state.ui_mask.fetch_or(bit, Ordering::AcqRel) | bit } else { state.ui_mask.fetch_and(!bit, Ordering::AcqRel) & !bit };
+    state.engine()?.set_ui_active(mask != 0);
+    Ok(())
+}
+
+#[tauri::command]
+async fn engine_set_resume_after_wake(state: State<'_, AppState>, on: bool) -> Res<()> {
+    state.engine()?.set_resume_after_wake(on);
+    Ok(())
+}
+
+#[tauri::command]
+async fn engine_set_normalize(state: State<'_, AppState>, on: bool) -> Res<()> {
+    state.engine()?.set_normalize(on);
     Ok(())
 }
 
@@ -208,6 +226,37 @@ async fn lib_set_album(state: State<'_, AppState>, ids: Vec<i64>, album: String)
 #[tauri::command]
 async fn lib_update_track(state: State<'_, AppState>, id: i64, title: String, artist: String, album: String) -> Res<()> {
     state.lib.update_track(id, &title, &artist, &album)
+}
+
+unsafe extern "C" {
+    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+}
+const QOS_CLASS_BACKGROUND: u32 = 0x09;
+
+/// Measures the loudness of tracks that have none, on a background-priority thread (macOS keeps
+/// that on the efficiency cores). Emits `analysis` progress and `analysis-done`.
+#[tauri::command]
+async fn lib_analyze_pending(app: AppHandle, state: State<'_, AppState>) -> Res<()> {
+    if state.analyzing.swap(true, Ordering::AcqRel) {
+        return Ok(()); // already running
+    }
+    let lib = state.lib.clone();
+    std::thread::Builder::new()
+        .name("ff-loudness".into())
+        .spawn(move || {
+            unsafe { pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0) };
+            let handle = app.clone();
+            let total = loudness::analyze_pending(&lib, |done, total| {
+                let _ = handle.emit("analysis", serde_json::json!({ "done": done, "total": total }));
+                std::thread::sleep(std::time::Duration::from_millis(40)); // be gentle between files
+            });
+            if let Some(s) = app.try_state::<AppState>() {
+                s.analyzing.store(false, Ordering::Release);
+            }
+            let _ = app.emit("analysis-done", total);
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -328,6 +377,57 @@ async fn set_keep_awake(state: State<'_, AppState>, on: bool) -> Res<bool> {
     Ok(a.is_active())
 }
 
+// ------------------------------------------------------------------ mini-player
+
+/// Opens (or focuses) the small floating player. The window exists only while it is open.
+#[tauri::command]
+async fn mini_open(app: AppHandle) -> Res<()> {
+    if let Some(w) = app.get_webview_window("mini") {
+        let _ = w.show();
+        let _ = w.set_focus();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(&app, "mini", tauri::WebviewUrl::App("index.html".into()))
+        .title("FocusFlow")
+        .inner_size(400.0, 148.0)
+        .resizable(false)
+        .maximizable(false)
+        .always_on_top(true)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn mini_close(app: AppHandle) -> Res<()> {
+    if let Some(w) = app.get_webview_window("mini") {
+        w.destroy().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn mini_exists(app: AppHandle) -> Res<bool> {
+    Ok(app.get_webview_window("mini").is_some())
+}
+
+#[tauri::command]
+async fn mini_set_pinned(app: AppHandle, pinned: bool) -> Res<()> {
+    if let Some(w) = app.get_webview_window("mini") {
+        w.set_always_on_top(pinned).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Shows (or clears) the current song next to the menu-bar icon.
+#[tauri::command]
+async fn set_tray_title(app: AppHandle, title: Option<String>) -> Res<()> {
+    if let Some(tray) = app.tray_by_id("main") {
+        tray.set_title(title).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn set_hide_on_close(state: State<'_, AppState>, on: bool) -> Res<()> {
     state.hide_on_close.store(on, Ordering::Relaxed);
@@ -366,6 +466,12 @@ async fn selftest_remove(path: String) -> Res<()> {
 #[tauri::command]
 async fn yt_tools() -> Res<ytdl::ToolStatus> {
     Ok(ytdl::tool_status())
+}
+
+/// Upgrades yt-dlp through Homebrew. Runs only when the user presses "Update yt-dlp".
+#[tauri::command]
+async fn yt_update() -> Res<String> {
+    tauri::async_runtime::spawn_blocking(ytdl::update_ytdlp).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -436,15 +542,18 @@ pub fn run() {
                 config: Mutex::new(config),
                 awake: Mutex::new(awake::KeepAwake::default()),
                 hide_on_close: AtomicBool::new(true),
+                analyzing: AtomicBool::new(false),
+                ui_mask: std::sync::atomic::AtomicU32::new(1),
             });
 
             let show = MenuItem::with_id(app, "show", "Show FocusFlow", true, None::<&str>)?;
+            let mini = MenuItem::with_id(app, "mini", "Mini player", true, None::<&str>)?;
             let toggle = MenuItem::with_id(app, "toggle", "Play / Pause", true, None::<&str>)?;
             let prev = MenuItem::with_id(app, "prev", "Previous", true, None::<&str>)?;
             let next = MenuItem::with_id(app, "next", "Next", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit FocusFlow", true, None::<&str>)?;
             let sep = PredefinedMenuItem::separator(app)?;
-            let menu = Menu::with_items(app, &[&show, &sep, &toggle, &prev, &next, &sep, &quit])?;
+            let menu = Menu::with_items(app, &[&show, &mini, &sep, &toggle, &prev, &next, &sep, &quit])?;
             TrayIconBuilder::with_id("main")
                 .icon(app.default_window_icon().cloned().ok_or("missing icon")?)
                 .icon_as_template(false)
@@ -453,6 +562,12 @@ pub fn run() {
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => show_main(app),
+                    "mini" => {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let _ = mini_open(app).await;
+                        });
+                    }
                     "quit" => app.exit(0),
                     other => {
                         let _ = app.emit("tray-action", other.to_string());
@@ -463,6 +578,9 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() != "main" {
+                    return;
+                }
                 let hide = window.app_handle().state::<AppState>().hide_on_close.load(Ordering::Relaxed);
                 if hide {
                     api.prevent_close();
@@ -484,6 +602,8 @@ pub fn run() {
             engine_cancel_fade,
             engine_status,
             engine_set_ui_active,
+            engine_set_normalize,
+            engine_set_resume_after_wake,
             get_paths,
             set_library_dir,
             lib_list_tracks,
@@ -493,6 +613,7 @@ pub fn run() {
             lib_set_favorite,
             lib_set_album,
             lib_get_art,
+            lib_analyze_pending,
             lib_update_track,
             lib_refresh_missing,
             lib_mark_missing,
@@ -509,8 +630,14 @@ pub fn run() {
             media_set_now_playing,
             set_keep_awake,
             set_hide_on_close,
+            mini_open,
+            mini_close,
+            mini_exists,
+            mini_set_pinned,
+            set_tray_title,
             quit_app,
             yt_tools,
+            yt_update,
             selftest_info,
             selftest_write,
             selftest_remove,

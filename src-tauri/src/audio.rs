@@ -44,6 +44,8 @@ pub enum EngineEvent {
     OutputChanged { device: String },
     /// The output device that was playing disappeared (e.g. earbuds disconnected), so playback paused.
     DevicePaused,
+    /// The Mac slept and woke. `resumed` says whether playback carried on or was paused (a setting).
+    Woke { slept_secs: f64, resumed: bool },
 }
 
 pub type Emitter = Arc<dyn Fn(EngineEvent) + Send + Sync>;
@@ -61,9 +63,17 @@ pub struct Deck {
     played: AtomicU64,
     start_frames: u64,
     rate: u32,
+    /// Loudness-normalisation gain (linear, f32 bits). 1.0 = unchanged.
+    gain: AtomicU32,
 }
 
 impl Deck {
+    pub fn set_gain_db(&self, db: f64) {
+        self.gain.store((10f64.powf(db / 20.0) as f32).to_bits(), Ordering::Relaxed);
+    }
+    fn gain(&self) -> f32 {
+        f32::from_bits(self.gain.load(Ordering::Relaxed))
+    }
     fn position(&self) -> f64 {
         (self.start_frames + self.played.load(Ordering::Relaxed)) as f64 / self.rate as f64
     }
@@ -87,6 +97,7 @@ struct Opened {
     track_id: u32,
     src_rate: u32,
     frames: Option<u64>,
+    time_base: Option<symphonia::core::units::TimeBase>,
 }
 
 fn open_source(path: &str) -> Result<Opened, String> {
@@ -107,11 +118,12 @@ fn open_source(path: &str) -> Result<Opened, String> {
         .ok_or("missing audio parameters")?;
     let src_rate = params.sample_rate.ok_or("unknown sample rate")?;
     let frames = track.num_frames;
+    let time_base = track.time_base;
     let decoder = symphonia::default::get_codecs()
         .make_audio_decoder(params, &AudioDecoderOptions::default())
         .map_err(|e| format!("unsupported codec: {e}"))?;
     let track_id = track.id;
-    Ok(Opened { format, decoder, track_id, src_rate, frames })
+    Ok(Opened { format, decoder, track_id, src_rate, frames, time_base })
 }
 
 /// Opens a file, starts its decoder thread and returns the deck immediately.
@@ -122,9 +134,23 @@ pub fn open_deck(path: &str, start_secs: f64, out_rate: u32, duration_hint: f64)
         _ => duration_hint,
     };
     let start = start_secs.max(0.0).min(if duration > 1.0 { duration - 0.5 } else { f64::MAX });
+    // Container seeks land on a packet boundary at or before the target (up to a few tens of
+    // milliseconds early in VBR MP3). Decode from there and drop the extra frames for an exact start.
+    let mut skip_frames = 0u64;
     if start > 0.05 {
         if let Some(t) = Time::try_from_secs_f64(start) {
-            let _ = src.format.seek(SeekMode::Accurate, SeekTo::Time { time: t, track_id: Some(src.track_id) });
+            if let Ok(to) = src.format.seek(SeekMode::Accurate, SeekTo::Time { time: t, track_id: Some(src.track_id) }) {
+                let delta = to.required_ts.get() - to.actual_ts.get();
+                if delta > 0 {
+                    let secs = match src.time_base {
+                        Some(tb) => delta as f64 * tb.numer.get() as f64 / tb.denom.get() as f64,
+                        None => delta as f64 / src.src_rate as f64,
+                    };
+                    if secs < 10.0 {
+                        skip_frames = (secs * src.src_rate as f64).round() as u64;
+                    }
+                }
+            }
             src.decoder.reset();
         }
     }
@@ -139,55 +165,172 @@ pub fn open_deck(path: &str, start_secs: f64, out_rate: u32, duration_hint: f64)
         played: AtomicU64::new(0),
         start_frames: (start * out_rate as f64) as u64,
         rate: out_rate,
+        gain: AtomicU32::new(1.0f32.to_bits()),
     });
     let d = Arc::downgrade(&deck);
     std::thread::Builder::new()
         .name("ff-decode".into())
-        .spawn(move || decode_loop(d, src, out_rate))
+        .spawn(move || decode_loop(d, src, out_rate, skip_frames))
         .map_err(|e| e.to_string())?;
     Ok(deck)
 }
 
+/// Converts between sample rates with rubato's FFT resampler (high quality for a fixed ratio).
+/// Equal rates pass straight through at no cost.
 struct Resampler {
-    ratio: f64, // source frames per output frame
-    pos: f64,
-    prev: [f32; 2],
-    primed: bool,
+    inner: Option<rubato::Fft<f32>>,
+    pending: Vec<f32>,
+    chunk_out: Vec<f32>,
+    delay_left: usize,
+    frames_in: u64,
+    frames_out: u64,
+    ratio: f64,
 }
 
 impl Resampler {
-    fn new(src: u32, dst: u32) -> Self {
-        Self { ratio: src as f64 / dst as f64, pos: 0.0, prev: [0.0; 2], primed: false }
+    fn new(src: u32, dst: u32) -> Result<Self, String> {
+        let inner = if src == dst {
+            None
+        } else {
+            Some(rubato::Fft::<f32>::new(src as usize, dst as usize, 1024, 2, rubato::FixedSync::Input).map_err(|e| format!("resampler: {e}"))?)
+        };
+        let delay_left = inner.as_ref().map(|r| rubato::Resampler::output_delay(r)).unwrap_or(0);
+        Ok(Self { inner, pending: Vec::new(), chunk_out: Vec::new(), delay_left, frames_in: 0, frames_out: 0, ratio: dst as f64 / src as f64 })
     }
-    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
-        if (self.ratio - 1.0).abs() < 1e-9 {
+
+    /// Runs one chunk through the resampler. `partial` = how many real frames the chunk holds (the rest is silence).
+    fn run_chunk(&mut self, chunk: &[f32], partial: Option<usize>, cap: Option<u64>, out: &mut Vec<f32>) -> Result<(), String> {
+        use rubato::audioadapter_buffers::direct::InterleavedSlice;
+        use rubato::Resampler as _;
+        let r = self.inner.as_mut().expect("only called when resampling");
+        let need = r.input_frames_next();
+        let out_frames = r.output_frames_next();
+        self.chunk_out.resize(out_frames * 2, 0.0);
+        let input = InterleavedSlice::new(chunk, 2, need).map_err(|e| format!("resampler: {e}"))?;
+        let mut output = InterleavedSlice::new_mut(&mut self.chunk_out, 2, out_frames).map_err(|e| format!("resampler: {e}"))?;
+        let indexing = rubato::Indexing { input_offset: 0, output_offset: 0, partial_len: partial, active_channels_mask: None };
+        let (_, written) = r.process_into_buffer(&input, &mut output, Some(&indexing)).map_err(|e| format!("resampler: {e}"))?;
+        // The first frames out are the filter's start-up delay.
+        let skip = self.delay_left.min(written);
+        self.delay_left -= skip;
+        let mut take = written - skip;
+        if let Some(cap) = cap {
+            take = take.min(cap.saturating_sub(self.frames_out) as usize);
+        }
+        out.extend_from_slice(&self.chunk_out[skip * 2..(skip + take) * 2]);
+        self.frames_out += take as u64;
+        Ok(())
+    }
+
+    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) -> Result<(), String> {
+        if self.inner.is_none() {
             out.extend_from_slice(input);
-            return;
+            return Ok(());
         }
-        let n = input.len() / 2;
-        let mut i = 0usize;
-        if !self.primed && n > 0 {
-            self.prev = [input[0], input[1]];
-            self.primed = true;
-        }
-        // `pos` is the fractional offset between `prev` (index -1) and input[0].
-        while i < n {
-            let next = [input[i * 2], input[i * 2 + 1]];
-            while self.pos < 1.0 {
-                let t = self.pos as f32;
-                out.push(self.prev[0] + (next[0] - self.prev[0]) * t);
-                out.push(self.prev[1] + (next[1] - self.prev[1]) * t);
-                self.pos += self.ratio;
+        self.frames_in += (input.len() / 2) as u64;
+        self.pending.extend_from_slice(input);
+        loop {
+            let need = rubato::Resampler::input_frames_next(self.inner.as_ref().expect("resampling"));
+            if self.pending.len() / 2 < need {
+                return Ok(());
             }
-            self.pos -= 1.0;
-            self.prev = next;
-            i += 1;
+            let chunk: Vec<f32> = self.pending.drain(..need * 2).collect();
+            self.run_chunk(&chunk, None, None, out)?;
+        }
+    }
+
+    /// Flushes what is left at the end of a stream, so the output is exactly as long as it should be.
+    fn finish(&mut self, out: &mut Vec<f32>) -> Result<(), String> {
+        if self.inner.is_none() {
+            return Ok(());
+        }
+        let expected = (self.frames_in as f64 * self.ratio).round() as u64;
+        let remaining = self.pending.len() / 2;
+        let need = rubato::Resampler::input_frames_next(self.inner.as_ref().expect("resampling"));
+        let mut chunk = std::mem::take(&mut self.pending);
+        chunk.resize(need * 2, 0.0);
+        self.run_chunk(&chunk, Some(remaining), Some(expected), out)?;
+        // Push silence through until the delayed tail has come out.
+        let silence = vec![0.0f32; need * 2];
+        let mut guard = 0;
+        while self.frames_out < expected && guard < 8 {
+            self.run_chunk(&silence, Some(0), Some(expected), out)?;
+            guard += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Mixes interleaved samples with `ch` channels down (or up) to interleaved stereo.
+fn to_stereo(raw: &[f32], ch: usize, out: &mut Vec<f32>) {
+    out.clear();
+    for f in raw.chunks_exact(ch.max(1)) {
+        match ch {
+            1 => {
+                out.push(f[0]);
+                out.push(f[0]);
+            }
+            2 => {
+                out.push(f[0]);
+                out.push(f[1]);
+            }
+            _ => {
+                let c = f[2] * 0.707;
+                out.push(f[0] + c);
+                out.push(f[1] + c);
+            }
         }
     }
 }
 
-fn decode_loop(deck: std::sync::Weak<Deck>, mut src: Opened, out_rate: u32) {
-    let mut resampler = Resampler::new(src.src_rate, out_rate);
+/// Decodes a whole file as interleaved stereo at its own sample rate, handing each chunk (and the
+/// rate) to `sink`. Used for loudness analysis.
+pub fn decode_stereo(path: &str, mut sink: impl FnMut(&[f32], u32)) -> Result<u32, String> {
+    let mut src = open_source(path)?;
+    let (mut raw, mut stereo) = (Vec::new(), Vec::new());
+    let mut bad = 0u32;
+    loop {
+        let packet = match src.format.next_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) | Err(SymError::IoError(_)) | Err(SymError::ResetRequired) => break,
+            Err(e) => return Err(e.to_string()),
+        };
+        if packet.track_id != src.track_id {
+            continue;
+        }
+        match src.decoder.decode(&packet) {
+            Ok(buf) => {
+                let ch = buf.spec().channels().count().max(1);
+                raw.resize(buf.samples_interleaved(), f32::MID);
+                buf.copy_to_slice_interleaved(&mut raw);
+                to_stereo(&raw, ch, &mut stereo);
+                sink(&stereo, src.src_rate);
+            }
+            Err(SymError::DecodeError(_)) | Err(SymError::IoError(_)) => {
+                bad += 1;
+                if bad > 200 {
+                    return Err("too many undecodable packets".into());
+                }
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(src.src_rate)
+}
+
+fn decode_loop(deck: std::sync::Weak<Deck>, mut src: Opened, out_rate: u32, mut skip_frames: u64) {
+    let mut resampler = match Resampler::new(src.src_rate, out_rate) {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some(d) = deck.upgrade() {
+                if let Ok(mut err) = d.error.lock() {
+                    *err = Some(e);
+                }
+                d.done.store(true, Ordering::Release);
+            }
+            return;
+        }
+    };
     let mut raw: Vec<f32> = Vec::new();
     let mut stereo: Vec<f32> = Vec::new();
     let mut resampled: Vec<f32> = Vec::new();
@@ -230,26 +373,17 @@ fn decode_loop(deck: std::sync::Weak<Deck>, mut src: Opened, out_rate: u32) {
                 let ch = buf.spec().channels().count().max(1);
                 raw.resize(buf.samples_interleaved(), f32::MID);
                 buf.copy_to_slice_interleaved(&mut raw);
-                stereo.clear();
-                for f in raw.chunks_exact(ch) {
-                    match ch {
-                        1 => {
-                            stereo.push(f[0]);
-                            stereo.push(f[0]);
-                        }
-                        2 => {
-                            stereo.push(f[0]);
-                            stereo.push(f[1]);
-                        }
-                        _ => {
-                            let c = f[2] * 0.707;
-                            stereo.push(f[0] + c);
-                            stereo.push(f[1] + c);
-                        }
-                    }
+                to_stereo(&raw, ch, &mut stereo);
+                if skip_frames > 0 {
+                    let n = (skip_frames as usize).min(stereo.len() / 2);
+                    stereo.drain(..n * 2);
+                    skip_frames -= n as u64;
                 }
                 resampled.clear();
-                resampler.process(&stereo, &mut resampled);
+                if let Err(e) = resampler.process(&stereo, &mut resampled) {
+                    failure = Some(e);
+                    break;
+                }
                 if let Ok(mut b) = d.buf.lock() {
                     b.extend(resampled.iter().copied());
                 }
@@ -268,6 +402,18 @@ fn decode_loop(deck: std::sync::Weak<Deck>, mut src: Opened, out_rate: u32) {
         }
     }
     if let Some(d) = deck.upgrade() {
+        if failure.is_none() {
+            // Flush the resampler's tail so the track ends exactly where it should.
+            resampled.clear();
+            match resampler.finish(&mut resampled) {
+                Ok(()) => {
+                    if let Ok(mut b) = d.buf.lock() {
+                        b.extend(resampled.iter().copied());
+                    }
+                }
+                Err(e) => failure = Some(e),
+            }
+        }
         if let Some(msg) = failure {
             if let Ok(mut e) = d.error.lock() {
                 *e = Some(msg);
@@ -290,16 +436,18 @@ struct Active {
     deck: Arc<Deck>,
     fade: Option<Fade>,
     scratch: Vec<f32>,
+    /// Normalisation gain currently applied; glides to its target so toggling never clicks.
+    norm: Option<f32>,
 }
 
 impl Active {
     fn new(deck: Arc<Deck>, fade: Option<Fade>) -> Self {
-        Self { deck, fade, scratch: Vec::new() }
+        Self { deck, fade, scratch: Vec::new(), norm: None }
     }
 
     /// Pulls up to `frames` frames into `self.scratch[..]` with fade gain applied.
     /// Returns the number of frames produced.
-    fn pull(&mut self, frames: usize) -> usize {
+    fn pull(&mut self, frames: usize, normalize: bool) -> usize {
         if self.scratch.len() < frames * 2 {
             self.scratch.resize(frames * 2, 0.0);
         }
@@ -310,7 +458,11 @@ impl Active {
             for i in 0..take {
                 let l = b.pop_front().unwrap_or(0.0);
                 let r = b.pop_front().unwrap_or(0.0);
-                let g = self.gain_step();
+                let target = if normalize { deck.gain() } else { 1.0 };
+                let mut cur = self.norm.unwrap_or(target);
+                cur += (target - cur) * 0.002;
+                self.norm = Some(cur);
+                let g = self.gain_step() * cur;
                 self.scratch[i * 2] = l * g;
                 self.scratch[i * 2 + 1] = r * g;
             }
@@ -347,6 +499,7 @@ pub struct Mixer {
     volume: f32,
     vol_smooth: f32,
     muted: bool,
+    pub normalize: bool,
     pub crossfade: f32,
     master_fade: Option<Fade>,
     master_gain: f32,
@@ -369,6 +522,7 @@ impl Mixer {
             volume: 0.8,
             vol_smooth: 0.8,
             muted: false,
+            normalize: true,
             crossfade: 3.0,
             master_fade: None,
             master_gain: 1.0,
@@ -498,12 +652,17 @@ impl Mixer {
     }
 
     /// Everything needed to resume the same audio at another output sample rate.
-    fn snapshot(&self) -> (Option<(String, f64, f64)>, Option<(String, f64)>, bool) {
+    #[allow(clippy::type_complexity)]
+    fn snapshot(&self) -> (Option<(String, f64, f64, f32)>, Option<(String, f64, f32)>, bool) {
         (
-            self.current.as_ref().map(|a| (a.deck.path.clone(), a.deck.position(), a.deck.duration)),
-            self.next.as_ref().map(|d| (d.path.clone(), d.duration)),
+            self.current.as_ref().map(|a| (a.deck.path.clone(), a.deck.position(), a.deck.duration, a.deck.gain())),
+            self.next.as_ref().map(|d| (d.path.clone(), d.duration, d.gain())),
             self.paused,
         )
+    }
+
+    pub fn current_gain(&self) -> f32 {
+        self.current.as_ref().map(|a| a.deck.gain()).unwrap_or(1.0)
     }
 
     fn reset_for_rate(&mut self, rate: u32) {
@@ -531,7 +690,7 @@ impl Mixer {
         let mut got = 0;
         while got < frames {
             let Some(act) = self.current.as_mut() else { break };
-            let n = act.pull(frames - got);
+            let n = act.pull(frames - got, self.normalize);
             for i in 0..n * 2 {
                 self.mixbuf[got * 2 + i] += act.scratch[i];
             }
@@ -553,7 +712,7 @@ impl Mixer {
         }
 
         for f in self.fading.iter_mut() {
-            let n = f.pull(frames);
+            let n = f.pull(frames, self.normalize);
             for i in 0..n * 2 {
                 self.mixbuf[i] += f.scratch[i];
             }
@@ -618,6 +777,9 @@ pub struct Shared {
     channels: AtomicU32,
     /// False while the window is hidden: progress updates are then sent far less often.
     ui_active: AtomicBool,
+    resume_after_wake: AtomicBool,
+    /// Set from a CoreAudio callback when the default output device or the device list changes.
+    device_dirty: Arc<AtomicBool>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -647,6 +809,8 @@ impl Engine {
             device: Mutex::new(String::new()),
             channels: AtomicU32::new(2),
             ui_active: AtomicBool::new(true),
+            resume_after_wake: AtomicBool::new(true),
+            device_dirty: Arc::new(AtomicBool::new(false)),
         });
         let (tx, rx) = std::sync::mpsc::channel();
         let s2 = shared.clone();
@@ -673,6 +837,10 @@ impl Engine {
         self.shared.channels.load(Ordering::Relaxed)
     }
 
+    pub fn set_resume_after_wake(&self, on: bool) {
+        self.shared.resume_after_wake.store(on, Ordering::Relaxed);
+    }
+
     pub fn set_ui_active(&self, active: bool) {
         self.shared.ui_active.store(active, Ordering::Relaxed);
     }
@@ -681,9 +849,10 @@ impl Engine {
         self.shared.device.lock().map(|d| d.clone()).unwrap_or_default()
     }
 
-    pub fn play(&self, path: &str, start: f64, fade_secs: f32, duration_hint: f64) -> Result<PlayInfo, String> {
+    pub fn play(&self, path: &str, start: f64, fade_secs: f32, duration_hint: f64, gain_db: f64) -> Result<PlayInfo, String> {
         let rate = self.shared.rate.load(Ordering::Relaxed);
         let deck = open_deck(path, start, rate, duration_hint)?;
+        deck.set_gain_db(gain_db);
         let duration = deck.duration;
         let mut m = self.lock();
         if m.rate != rate {
@@ -694,11 +863,13 @@ impl Engine {
     }
 
     /// Loads (but does not play) the track that follows the current one.
-    pub fn set_next(&self, path: Option<&str>, duration_hint: f64) -> Result<(), String> {
+    pub fn set_next(&self, path: Option<&str>, duration_hint: f64, gain_db: f64) -> Result<(), String> {
         let deck = match path {
             Some(p) => {
                 let rate = self.shared.rate.load(Ordering::Relaxed);
-                Some(open_deck(p, 0.0, rate, duration_hint)?)
+                let d = open_deck(p, 0.0, rate, duration_hint)?;
+                d.set_gain_db(gain_db);
+                Some(d)
             }
             None => None,
         };
@@ -721,15 +892,16 @@ impl Engine {
     }
 
     pub fn seek(&self, secs: f64) -> Result<(), String> {
-        let (path, dur, paused) = {
+        let (path, dur, paused, gain) = {
             let m = self.lock();
             match m.position() {
-                (Some(p), _, d) => (p, d, m.state() == "paused"),
+                (Some(p), _, d) => (p, d, m.state() == "paused", m.current_gain()),
                 _ => return Ok(()),
             }
         };
         let rate = self.shared.rate.load(Ordering::Relaxed);
         let deck = open_deck(&path, secs, rate, dur)?;
+        deck.gain.store(gain.to_bits(), Ordering::Relaxed);
         let mut m = self.lock();
         m.install(deck, QUICK_FADE_SECS);
         m.set_paused(paused);
@@ -740,6 +912,10 @@ impl Engine {
         let mut m = self.lock();
         m.volume = v.clamp(0.0, 1.0);
         m.muted = muted;
+    }
+
+    pub fn set_normalize(&self, on: bool) {
+        self.lock().normalize = on;
     }
 
     pub fn set_crossfade(&self, secs: f32) {
@@ -766,6 +942,71 @@ impl Engine {
 fn device_id(device: &cpal::Device) -> String {
     use cpal::traits::DeviceTrait;
     device.id().map(|i| i.to_string()).unwrap_or_else(|_| "unknown".into())
+}
+
+// ---------------------------------------------------------------- sleep detection and device notifications
+
+unsafe extern "C" {
+    fn clock_gettime_nsec_np(clock_id: u32) -> u64;
+}
+const CLOCK_MONOTONIC_RAW: u32 = 4; // keeps counting while the Mac sleeps
+const CLOCK_UPTIME_RAW: u32 = 8; // pauses while the Mac sleeps
+
+/// Time spent asleep since the last reading, if it was long enough to matter.
+pub fn slept_seconds(continuous_delta_ns: u64, awake_delta_ns: u64) -> Option<f64> {
+    let asleep = continuous_delta_ns.saturating_sub(awake_delta_ns) as f64 / 1e9;
+    (asleep > 3.0).then_some(asleep)
+}
+
+struct Clocks {
+    continuous: u64,
+    awake: u64,
+}
+
+impl Clocks {
+    fn now() -> Self {
+        unsafe { Self { continuous: clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW), awake: clock_gettime_nsec_np(CLOCK_UPTIME_RAW) } }
+    }
+    fn advance(&self) -> (Clocks, Option<f64>) {
+        let now = Clocks::now();
+        let slept = slept_seconds(now.continuous.saturating_sub(self.continuous), now.awake.saturating_sub(self.awake));
+        (now, slept)
+    }
+}
+
+#[repr(C)]
+struct AudioObjectPropertyAddress {
+    selector: u32,
+    scope: u32,
+    element: u32,
+}
+
+type AudioListener = extern "C" fn(u32, u32, *const AudioObjectPropertyAddress, *mut std::ffi::c_void) -> i32;
+
+#[link(name = "CoreAudio", kind = "framework")]
+unsafe extern "C" {
+    fn AudioObjectAddPropertyListener(object: u32, address: *const AudioObjectPropertyAddress, listener: AudioListener, client: *mut std::ffi::c_void) -> i32;
+}
+
+extern "C" fn on_audio_hardware_change(_object: u32, _count: u32, _addresses: *const AudioObjectPropertyAddress, client: *mut std::ffi::c_void) -> i32 {
+    // SAFETY: `client` is the Arc<AtomicBool> leaked in `register_device_listener`, valid for the whole process.
+    let flag = unsafe { &*(client as *const AtomicBool) };
+    flag.store(true, Ordering::Release);
+    0
+}
+
+/// Asks CoreAudio to set `flag` whenever the default output device or the list of devices changes.
+pub fn register_device_listener(flag: Arc<AtomicBool>) -> bool {
+    const SYSTEM_OBJECT: u32 = 1;
+    const GLOBAL: u32 = 0x676C_6F62; // 'glob'
+    let raw = Arc::into_raw(flag) as *mut std::ffi::c_void; // intentionally leaked: the listener lives as long as the process
+    let mut ok = true;
+    for selector in [0x644F_7574u32 /* 'dOut': default output device */, 0x6465_7623 /* 'dev#': device list */] {
+        let addr = AudioObjectPropertyAddress { selector, scope: GLOBAL, element: 0 };
+        let rc = unsafe { AudioObjectAddPropertyListener(SYSTEM_OBJECT, &addr, on_audio_hardware_change, raw) };
+        ok &= rc == 0;
+    }
+    ok
 }
 
 fn device_exists(name: &str) -> bool {
@@ -845,6 +1086,10 @@ fn engine_thread(shared: Arc<Shared>, init: std::sync::mpsc::Sender<Result<(), S
     let mut init = Some(init);
     let mut stream: Option<cpal::Stream> = None;
     let mut last_check = Instant::now();
+    // CoreAudio tells us when devices change, so there is nothing to poll. If registering fails we fall back to polling.
+    let listening = register_device_listener(shared.device_dirty.clone());
+    let mut dirty_at: Option<Instant> = None;
+    let mut clocks = Clocks::now();
     let mut last_tick = Instant::now() - Duration::from_secs(1);
     let mut last_serial = 0u64;
     let mut first = true;
@@ -896,12 +1141,36 @@ fn engine_thread(shared: Arc<Shared>, init: std::sync::mpsc::Sender<Result<(), S
         // Crossfade starts and device changes do not need finer timing than this.
         std::thread::sleep(Duration::from_millis(200));
 
-        if last_check.elapsed() > Duration::from_secs(1) {
+        // The Mac slept? (One clock keeps counting during sleep, the other does not.)
+        let (now_clocks, slept) = clocks.advance();
+        clocks = now_clocks;
+        if let Some(secs) = slept {
+            let resume = shared.resume_after_wake.load(Ordering::Relaxed);
+            let mut m = shared.mixer.lock().unwrap_or_else(|e| e.into_inner());
+            let was_playing = m.state() == "playing";
+            if was_playing && !resume {
+                m.set_paused(true);
+            }
+            drop(m);
+            shared.rebuild.store(true, Ordering::Release); // start from a fresh output stream
+            if was_playing {
+                (shared.emit)(EngineEvent::Woke { slept_secs: secs, resumed: resume });
+            }
+        }
+
+        if listening {
+            if shared.device_dirty.swap(false, Ordering::AcqRel) {
+                dirty_at = Some(Instant::now()); // let the new device settle before switching
+            }
+            if dirty_at.map(|t| t.elapsed() > Duration::from_millis(300)).unwrap_or(false) {
+                dirty_at = None;
+                shared.rebuild.store(true, Ordering::Release);
+            }
+        } else if last_check.elapsed() > Duration::from_secs(1) {
             last_check = Instant::now();
             use cpal::traits::HostTrait;
             if let Some(d) = cpal::default_host().default_output_device() {
-                let now = device_id(&d);
-                if now != *shared.device.lock().unwrap() {
+                if device_id(&d) != *shared.device.lock().unwrap() {
                     shared.rebuild.store(true, Ordering::Release);
                 }
             }
@@ -952,14 +1221,16 @@ fn resume_at_new_rate(shared: &Arc<Shared>, rate: u32) {
         m.reset_for_rate(rate);
         snap
     };
-    if let Some((path, pos, dur)) = cur {
+    if let Some((path, pos, dur, gain)) = cur {
         if let Ok(deck) = open_deck(&path, pos, rate, dur) {
+            deck.gain.store(gain.to_bits(), Ordering::Relaxed);
             let mut m = shared.mixer.lock().unwrap_or_else(|e| e.into_inner());
             m.install(deck, QUICK_FADE_SECS);
             m.set_paused(paused);
-            if let Some((np, nd)) = next {
+            if let Some((np, nd, ng)) = next {
                 drop(m);
                 if let Ok(d) = open_deck(&np, 0.0, rate, nd) {
+                    d.gain.store(ng.to_bits(), Ordering::Relaxed);
                     shared.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_next(Some(d));
                 }
             }
@@ -1019,6 +1290,151 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         all
+    }
+
+    #[test]
+    fn sleep_is_detected_from_the_two_clocks() {
+        assert_eq!(slept_seconds(1_000_000_000, 1_000_000_000), None, "ordinary time passing is not sleep");
+        assert_eq!(slept_seconds(2_500_000_000, 200_000_000), None, "a short stall is not sleep");
+        let s = slept_seconds(3_600_000_000_000, 5_000_000_000).unwrap();
+        assert!((s - 3595.0).abs() < 1e-6, "an hour of wall time with 5 s awake = {s} s asleep");
+        let c = Clocks::now();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(c.advance().1.is_none(), "the real clocks agree while the Mac stays awake");
+    }
+
+    #[test]
+    fn core_audio_device_listener_registers_and_flags_changes() {
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(register_device_listener(flag.clone()), "CoreAudio refused the listener");
+        // Simulate the OS calling us.
+        let raw = Arc::into_raw(flag.clone()) as *mut std::ffi::c_void;
+        assert_eq!(on_audio_hardware_change(1, 0, std::ptr::null(), raw), 0);
+        assert!(flag.load(Ordering::Acquire));
+        unsafe { drop(Arc::from_raw(raw as *const AtomicBool)) };
+    }
+
+    /// A VBR MP3 whose loud section starts at exactly 5.000 s: seeking before it must put the
+    /// start of the loud section exactly where it belongs.
+    #[test]
+    fn seeking_in_a_vbr_mp3_is_sample_accurate() {
+        let Some(ffmpeg) = crate::ytdl::find_tool("ffmpeg") else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let mp3 = dir.path().join("step.mp3");
+        let expr = "aevalsrc=if(lt(t\\,5)\\,0.01*sin(2*PI*440*t)\\,0.6*sin(2*PI*440*t)):d=12:s=44100";
+        let st = std::process::Command::new(&ffmpeg).args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", expr, "-q:a", "5"]).arg(&mp3).status().unwrap();
+        assert!(st.success(), "could not synthesise the VBR test file");
+        let mut worst = 0.0f64;
+        for target in [3.37, 3.9, 4.35, 4.71, 4.8, 4.93] {
+            let d = open_deck(mp3.to_str().unwrap(), target, 44100, 0.0).unwrap();
+            wait_buffered(&d, 44100 * 3);
+            let first_loud = {
+                let b = d.buf.lock().unwrap();
+                b.iter().step_by(2).position(|v| v.abs() > 0.15).expect("loud section never arrived")
+            };
+            let expected = (5.0 - target) * 44100.0;
+            let err_ms = (first_loud as f64 - expected) / 44.1;
+            println!("seek to {target:5.2}s: loud section starts {err_ms:+.1} ms from where it should");
+            worst = worst.max(err_ms.abs());
+        }
+        // The codec itself smears an edge by up to one granule (~13 ms); a coarse seek would be off by a whole frame or more.
+        assert!(worst < 20.0, "worst seek error {worst:.1} ms");
+    }
+
+    fn tone(freq: f64, rate: u32, frames: usize, amp: f64) -> Vec<f32> {
+        (0..frames).flat_map(|i| { let v = (amp * (2.0 * std::f64::consts::PI * freq * i as f64 / rate as f64).sin()) as f32; [v, v] }).collect()
+    }
+
+    /// Resamples in chunks of the given size (the decoder's packets are not a fixed size).
+    fn resample_chunked(input: &[f32], src: u32, dst: u32, chunk: usize) -> Vec<f32> {
+        let mut r = Resampler::new(src, dst).unwrap();
+        let mut out = Vec::new();
+        for c in input.chunks(chunk * 2) {
+            r.process(c, &mut out).unwrap();
+        }
+        r.finish(&mut out).unwrap();
+        out
+    }
+
+    /// RMS error (in dB relative to the signal) between a resampled tone and the ideal tone at the new rate.
+    fn tone_error_db(out: &[f32], freq: f64, rate: u32, amp: f64) -> f64 {
+        let (skip, n) = (3000usize, out.len() / 2);
+        let (mut err, mut sig) = (0.0f64, 0.0f64);
+        for i in skip..n.saturating_sub(skip) {
+            let ideal = amp * (2.0 * std::f64::consts::PI * freq * i as f64 / rate as f64).sin();
+            err += (out[i * 2] as f64 - ideal).powi(2);
+            sig += ideal.powi(2);
+        }
+        10.0 * (err / sig).log10()
+    }
+
+    /// The linear interpolator FocusFlow used before, kept only to show how much better the new one is.
+    fn linear_reference(input: &[f32], src: u32, dst: u32) -> Vec<f32> {
+        let ratio = src as f64 / dst as f64;
+        let frames = input.len() / 2;
+        let n_out = (frames as f64 / ratio) as usize - 2;
+        (0..n_out).flat_map(|m| { let p = m as f64 * ratio; let i = p as usize; let t = (p - i as f64) as f32; let v = input[i * 2] * (1.0 - t) + input[(i + 1) * 2] * t; [v, v] }).collect()
+    }
+
+    #[test]
+    fn the_resampler_is_clean_and_far_better_than_linear() {
+        let input = tone(15_000.0, 44100, 44100 * 2, 0.5);
+        let new = resample_chunked(&input, 44100, 48000, 1152);
+        let old = linear_reference(&input, 44100, 48000);
+        let (e_new, e_old) = (tone_error_db(&new, 15_000.0, 48000, 0.5), tone_error_db(&old, 15_000.0, 48000, 0.5));
+        println!("15 kHz tone, 44.1 -> 48 kHz: new resampler error {e_new:.1} dB, old linear {e_old:.1} dB");
+        assert!(e_new < -60.0, "new resampler error {e_new:.1} dB");
+        assert!(e_new < e_old - 30.0, "should beat linear interpolation by a wide margin ({e_new:.1} vs {e_old:.1})");
+        // Down-conversion too.
+        let down = resample_chunked(&tone(1_000.0, 48000, 48000, 0.5), 48000, 44100, 1000);
+        assert!(tone_error_db(&down, 1_000.0, 44100, 0.5) < -60.0);
+    }
+
+    #[test]
+    fn resampled_length_is_exact_and_chunking_does_not_matter() {
+        let input = tone(440.0, 44100, 44100 * 3 + 123, 0.4);
+        let expected = ((44100 * 3 + 123) as f64 * 48000.0 / 44100.0).round() as usize;
+        let a = resample_chunked(&input, 44100, 48000, 1152);
+        let b = resample_chunked(&input, 44100, 48000, 777);
+        let c = resample_chunked(&input, 44100, 48000, 50_000);
+        assert_eq!(a.len() / 2, expected, "output length");
+        assert_eq!(b.len() / 2, expected);
+        assert_eq!(c.len() / 2, expected);
+        let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-3, "different packet sizes must give the same audio (worst difference {worst})");
+    }
+
+    #[test]
+    fn equal_rates_pass_through_unchanged() {
+        let input = tone(440.0, 44100, 5000, 0.4);
+        assert_eq!(resample_chunked(&input, 44100, 44100, 999), input);
+    }
+
+    #[test]
+    fn a_resampled_file_keeps_its_level_and_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = dir.path().join("t.wav");
+        write_wav(&w, 3.0, 44100, 440.0, 0.5);
+        let d = open_deck(w.to_str().unwrap(), 0.0, 48000, 0.0).unwrap();
+        for _ in 0..300 {
+            if d.done.load(Ordering::Acquire) { break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The buffer holds at most BUF_SECS, so drain it as a player would and count everything.
+        let mut total = 0usize;
+        let mut peak = 0.0f32;
+        for _ in 0..400 {
+            {
+                let mut b = d.buf.lock().unwrap();
+                total += b.len() / 2;
+                peak = b.iter().fold(peak, |p, v| p.max(v.abs()));
+                b.clear();
+            }
+            if d.done.load(Ordering::Acquire) && d.buf.lock().unwrap().is_empty() { break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!((total as i64 - 144_000).abs() <= 2, "3 s at 48 kHz should be 144000 frames, got {total}");
+        assert!((peak - 0.5).abs() < 0.02, "level preserved: {peak}");
     }
 
     #[test]
@@ -1114,6 +1530,31 @@ mod tests {
     }
 
     #[test]
+    fn normalisation_gain_scales_the_output_and_can_be_switched_off_smoothly() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.wav");
+        write_wav(&a, 4.0, 44100, 330.0, 0.5);
+        let deck = open_deck(a.to_str().unwrap(), 0.0, 44100, 0.0).unwrap();
+        deck.set_gain_db(-6.0206); // exactly half
+        wait_buffered(&deck, 44100 * 3);
+        let mut m = Mixer::new(44100);
+        m.volume = 1.0;
+        m.vol_smooth = 1.0;
+        m.install(deck, 0.0);
+        let peak = |v: &[f32]| v.iter().fold(0.0f32, |p, x| p.max(x.abs()));
+        render_secs(&mut m, 0.2); // let the quick fade-in finish
+        let halved = peak(&render_secs(&mut m, 0.3));
+        assert!((halved - 0.25).abs() < 0.01, "peak with a -6 dB gain: {halved}");
+        m.normalize = false;
+        let during = render_secs(&mut m, 0.05);
+        let jump = during.windows(2).step_by(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(jump < 0.1, "switching off must glide, not jump (largest step {jump})");
+        render_secs(&mut m, 0.3);
+        let full = peak(&render_secs(&mut m, 0.2));
+        assert!((full - 0.5).abs() < 0.01, "peak with normalisation off: {full}");
+    }
+
+    #[test]
     fn single_track_with_no_next_ends_once() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.wav");
@@ -1181,9 +1622,9 @@ mod tests {
         engine.set_crossfade(1.5);
         let a = dir.join("tone_a.mp3");
         let b = dir.join("tone_b.m4a");
-        let info = engine.play(a.to_str().unwrap(), 0.0, 0.0, 0.0).unwrap();
+        let info = engine.play(a.to_str().unwrap(), 0.0, 0.0, 0.0, 0.0).unwrap();
         assert!((info.duration - 6.0).abs() < 0.2);
-        engine.set_next(Some(b.to_str().unwrap()), 0.0).unwrap();
+        engine.set_next(Some(b.to_str().unwrap()), 0.0, 0.0).unwrap();
         // Track A is 6 s with a 1.5 s crossfade: B takes over at about 4.5 s.
         std::thread::sleep(Duration::from_secs(8));
         let evs = events.lock().unwrap().clone();
@@ -1210,7 +1651,7 @@ mod tests {
         let files = ["tone_a.mp3", "tone_b.m4a", "tone_c.flac", "tone_d.wav"];
         for i in 0..40 {
             let f = dir.join(files[i % files.len()]);
-            engine.play(f.to_str().unwrap(), 0.0, 0.35, 0.0).unwrap();
+            engine.play(f.to_str().unwrap(), 0.0, 0.35, 0.0, 0.0).unwrap();
             if i % 7 == 0 { engine.seek(1.0).unwrap(); }
             std::thread::sleep(Duration::from_millis(30));
         }

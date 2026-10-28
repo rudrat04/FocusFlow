@@ -22,6 +22,7 @@ export function TrackPage() {
     ["Duration", fmtTime(t.duration)],
     ["Format", t.format || "—"],
     ["Sample rate", t.sampleRate ? `${(t.sampleRate / 1000).toFixed(1)} kHz` : "—"],
+    ["Loudness", t.lufs === null || t.gainDb === null ? "Not measured yet" : `${t.lufs.toFixed(1)} LUFS · ${t.gainDb >= 0 ? "+" : "−"}${Math.abs(t.gainDb).toFixed(1)} dB applied when "Even out loudness" is on`],
     ["Channels", t.channels === 1 ? "Mono" : t.channels === 2 ? "Stereo" : String(t.channels)],
     ["File size", fmtSize(t.size)],
     ["Added", t.addedAt ? new Date(t.addedAt * 1000).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" }) : "—"],

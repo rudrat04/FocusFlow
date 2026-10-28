@@ -57,7 +57,7 @@ export default function App() {
   useShortcuts();
   // Tell the engine when the window is hidden so it can report progress far less often.
   useEffect(() => {
-    const tell = () => void api.engineSetUiActive(!document.hidden).catch(() => {});
+    const tell = () => void api.engineSetUiActive("main", !document.hidden).catch(() => {});
     document.addEventListener("visibilitychange", tell);
     tell();
     return () => document.removeEventListener("visibilitychange", tell);

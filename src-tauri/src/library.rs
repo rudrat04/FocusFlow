@@ -41,6 +41,9 @@ pub struct Track {
     pub favorite: bool,
     pub source_url: Option<String>,
     pub has_art: bool,
+    /// Integrated loudness (LUFS) and the gain (dB) that brings the track to the target. None until analysed.
+    pub lufs: Option<f64>,
+    pub gain_db: Option<f64>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -235,7 +238,7 @@ CREATE TABLE IF NOT EXISTS error_log (
 ";
 
 const TRACK_COLS: &str = "t.id, t.path, t.title, t.artist, t.album, t.duration, t.format, t.size, \
-    t.sample_rate, t.channels, t.added_at, t.missing, (f.track_id IS NOT NULL), t.source_url, (t.art_path IS NOT NULL)";
+    t.sample_rate, t.channels, t.added_at, t.missing, (f.track_id IS NOT NULL), t.source_url, (t.art_path IS NOT NULL), t.lufs, t.gain_db";
 const TRACK_FROM: &str = "FROM tracks t LEFT JOIN favorites f ON f.track_id = t.id";
 
 fn row_to_track(r: &rusqlite::Row) -> rusqlite::Result<Track> {
@@ -255,6 +258,8 @@ fn row_to_track(r: &rusqlite::Row) -> rusqlite::Result<Track> {
         favorite: r.get::<_, i64>(12)? != 0,
         source_url: r.get(13)?,
         has_art: r.get::<_, i64>(14)? != 0,
+        lufs: r.get(15)?,
+        gain_db: r.get(16)?,
     })
 }
 
@@ -282,6 +287,8 @@ impl Library {
         conn.execute_batch(SCHEMA).map_err(e)?;
         // Databases created by older builds lack the artwork column.
         let _ = conn.execute("ALTER TABLE tracks ADD COLUMN art_path TEXT", []);
+        let _ = conn.execute("ALTER TABLE tracks ADD COLUMN lufs REAL", []);
+        let _ = conn.execute("ALTER TABLE tracks ADD COLUMN gain_db REAL", []);
         Ok(Self { conn: Mutex::new(conn), art_dir })
     }
 
@@ -363,6 +370,20 @@ impl Library {
         let Ok(bytes) = std::fs::read(&path) else { return Ok(None) };
         let mime = if path.to_ascii_lowercase().ends_with("png") { "image/png" } else { "image/jpeg" };
         Ok(Some(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))))
+    }
+
+    /// Tracks that still need a loudness measurement.
+    pub fn pending_analysis(&self) -> Res<Vec<(i64, String)>> {
+        let conn = self.db();
+        let mut st = conn.prepare("SELECT id, path FROM tracks WHERE gain_db IS NULL AND missing = 0 ORDER BY id").map_err(e)?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(e)?.filter_map(|x| x.ok()).collect();
+        Ok(rows)
+    }
+
+    /// Stores a measurement. A track that cannot be measured (silence, errors) gets 0 dB so it is not retried forever.
+    pub fn set_loudness(&self, id: i64, lufs: Option<f64>, gain_db: f64) -> Res<()> {
+        self.db().execute("UPDATE tracks SET lufs = ?1, gain_db = ?2 WHERE id = ?3", params![lufs, gain_db, id]).map_err(e)?;
+        Ok(())
     }
 
     pub fn update_track(&self, id: i64, title: &str, artist: &str, album: &str) -> Res<()> {

@@ -31,6 +31,8 @@ core-foundation = "0.10.1"
 tauri-plugin-dialog = "2.8.4"
 base64 = "0.23.1"
 souvlaki = "0.9.3"
+rubato = "5.0.1"
+ebur128 = "0.1.11"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

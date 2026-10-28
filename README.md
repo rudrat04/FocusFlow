@@ -102,7 +102,9 @@ Pick the destination first: your **Music library**, a **New album** (every track
 
 The video's thumbnail becomes the cover art. A single-video link that merely contains `&list=` imports only that video; paste the playlist link itself to get them all. A continuous, gapless mix with no written track list can't be split by silence; paste timestamps for those.
 
-> Only import audio you have the right to keep. Downloading can violate a site's terms. If a download stops working, run `brew upgrade yt-dlp`.
+> Only import audio you have the right to keep. Downloading can violate a site's terms.
+
+**Keeping link import healthy.** `yt-dlp` breaks whenever YouTube changes, so FocusFlow checks how old your copy is (its version *is* its release date) and, past about six weeks, shows a banner with an **Update yt-dlp** button (it runs `brew upgrade yt-dlp` only when you press it). Failures are explained in plain English (private / removed video, sign-in or bot check, rate limiting, out-of-date yt-dlp, network trouble), network hiccups are retried automatically, and a blocked or out-of-date failure is retried once through alternate YouTube clients. Those retries are untested against real YouTube.
 
 ## Features
 
@@ -113,11 +115,15 @@ The video's thumbnail becomes the cover art. A single-video link that merely con
 - **Queue**: play next, add to end, remove, move up/down, or drag by the handle.
 - **Gapless or crossfaded** transitions; the next track is preloaded so there is no gap.
 - Restores your queue and position on launch, **paused**, never playing by itself.
+- **Even out loudness** (Settings, on by default): tracks are analysed once, in the background at the lowest priority, and a gain of up to −14 / +9 dB is applied (never enough to clip) so everything plays at about −16 LUFS. Toggling it glides, with no click.
+- **Exact seeking**, even in variable-bit-rate MP3s, and a high-quality resampler for files whose sample rate differs from your output device.
 - A track that fails is logged, you get a toast, and playback skips to the next playable one.
 
 ### Library
 
 - Songs, Albums, Playlists and Favorites, with search and filters (all / favorites / missing).
+- **Even loudness.** Every track is measured (EBU R128) in the background and brought to a similar volume, so a quiet piano piece doesn't follow a loud one. Toggle it in Settings.
+- **Mini player** you can float over other windows, plus an optional song title in the menu bar.
 - **Albums and playlists are editable**: rename, add songs (with a picker), remove songs, delete. Playlists can be reordered. Every album and playlist page has **Play** and **Shuffle**.
 - **Song page**: cover, duration, format, sample rate, channels, size, date added, playlists, file path, source link, and editable title / artist / album.
 - Clicking a song's **thumbnail** (or the cover/title in the bottom bar) plays it and opens Now Playing.
@@ -142,6 +148,9 @@ FocusFlow publishes what's playing to macOS (title, artist, cover, position) and
 
 - **Sleep timer** (moon button, 15–90 min): the volume fades out gradually, then playback stops.
 - **Keep Mac awake while playing** holds an IOKit assertion (`PreventUserIdleSystemSleep`) only while audio plays and releases it on pause, quit or when you turn it off. It does not keep the display awake.
+- **Resumes after sleep.** If music was playing when the Mac went to sleep, it carries on when the Mac wakes (a setting; off keeps it paused). Output-device changes (AirPods connecting, a cable pulled) are picked up instantly from macOS notifications rather than polling.
+- **Mini player** (the pip icon in the bottom bar, or the menu-bar icon → *Mini player*): artwork, title, seek, previous / play / next, favorite, and a pin to keep it above other windows. It's a separate small window that exists only while it's open, so it costs nothing when closed.
+- **Menu-bar title** (Settings): shows the current song next to the menu-bar icon.
 - Closing the window **hides it to the menu bar** and the music keeps playing; the menu-bar icon has Play/Pause, Previous, Next and Quit.
 
 ## Keyboard shortcuts
@@ -199,12 +208,14 @@ src/                      React + TypeScript interface
   lib/timers.ts           sleep timer                  (pure, tested)
   lib/transition.ts       engine-event decisions       (pure, tested)
   lib/player.ts           controller: engine, library, persistence
+  MiniApp.tsx             the floating mini player
   views/  components/     screens and UI parts
   themes.ts               generated landscapes
 src-tauri/src/
   audio.rs                decoder threads, mixer, crossfade, device handling
   dsp.rs                  spatial sound modes
   library.rs              SQLite library, albums, playlists, artwork, import
+  loudness.rs             EBU R128 loudness analysis and gain
   ytdl.rs                 link import, chapter / tracklist / silence splitting
   media.rs                macOS Now Playing and remote commands
   awake.rs                keep-awake power assertion
@@ -216,8 +227,8 @@ scripts/                  selftest.sh · bench.sh · screenshots.sh
 
 ```bash
 npm test                          # 24 frontend tests: queue, shuffle/repeat, timers, transitions
-cd src-tauri && cargo test --lib  # 32 backend tests: engine, library, sound modes, link splitting, keep-awake
-./scripts/selftest.sh             # drives the built app end to end: 40 checks, plays quietly for ~1 minute
+cd src-tauri && cargo test --lib  # 51 backend tests: engine, resampler, seeking, loudness, library, sound modes, link import, keep-awake
+./scripts/selftest.sh             # drives the built app end to end: 46 checks, plays quietly for ~1 minute
 ./scripts/bench.sh                # CPU / energy measurements
 ```
 
@@ -234,11 +245,11 @@ Step-by-step manual tests for all of these are in [`MANUAL_TEST_CHECKLIST.md`](M
 
 ## Known limitations
 
-- Playback can be interrupted by things no app controls: manual sleep, closing the lid on battery, a flat battery, shutdown, macOS updates, and some audio-device changes. Keep-awake only prevents *idle* sleep.
-- Resampling is linear interpolation (very slightly less pristine than a high-order resampler when a 44.1 kHz file plays on a 48 kHz device). Seeking in some VBR MP3s can land a few tens of milliseconds off.
-- Tracks aren't loudness-normalized, so different sources can differ in volume.
-- No mini-player window. Release builds are unsigned.
-- Link import depends on `yt-dlp` and on the site, and can break when the site changes.
+- **Some interruptions can't be prevented:** closing the lid on battery, a manual sleep, a flat battery, shutdown, and macOS updates. What FocusFlow *can* do, it does: it keeps the Mac from idle sleep while playing, resumes after wake, and follows device changes. Keep-awake only prevents *idle* sleep.
+- **Loudness is measured once per track** (in the background, so a freshly imported track plays unadjusted until its measurement finishes, usually seconds). A very quiet track is boosted by at most 9 dB, and never past the point where it would clip.
+- Release builds are **unsigned** (signing needs a paid Apple Developer account and matters only if you share the app).
+- Link import depends on `yt-dlp` and the site, and can still break when the site changes; the updater and retries reduce this, they don't eliminate it.
+- Spatial sound is FocusFlow's own lightweight processing, not measured-HRTF rendering.
 
 ## Troubleshooting
 

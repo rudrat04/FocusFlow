@@ -43,6 +43,9 @@ export function SettingsView() {
             {(["off", "all", "one"] as Repeat[]).map((r) => <button key={r} className={s.repeat === r ? "on" : ""} onClick={() => set({ repeat: r })}>{r === "off" ? "Off" : r === "all" ? "All" : "One"}</button>)}
           </div>
         </Setting>
+        <Setting title="Even out loudness" hint={<>Quieter and louder tracks are brought to a similar volume (about −16 LUFS), so a quiet piano piece does not follow a loud one. {st.analysis ? `Measuring: ${st.analysis.done} of ${st.analysis.total} tracks…` : (() => { const n = st.tracks.filter((t) => t.gainDb === null && !t.missing).length; return n ? `${n} track${n === 1 ? "" : "s"} not measured yet.` : "All tracks measured."; })()}</>}>
+          <Toggle label="Even out loudness" on={s.normalize} onChange={(v) => set({ normalize: v })} />
+        </Setting>
         <Setting title="Restore queue on launch" hint="Brings back your queue and position, paused. It never starts playing by itself.">
           <Toggle label="Restore on launch" on={s.resumeOnLaunch} onChange={(v) => set({ resumeOnLaunch: v })} />
         </Setting>
@@ -67,6 +70,12 @@ export function SettingsView() {
         <h3>Power and window</h3>
         <Setting title="Keep Mac awake while playing" hint="Holds a macOS power assertion against idle system sleep during playback; released when you pause or quit. The display may still sleep.">
           <Toggle label="Keep awake" on={s.keepAwake} onChange={(v) => set({ keepAwake: v })} />
+        </Setting>
+        <Setting title="Song title in the menu bar" hint="Shows the current song next to the FocusFlow menu-bar icon while it plays.">
+          <Toggle label="Menu-bar title" on={s.menuBarTitle} onChange={(v) => set({ menuBarTitle: v })} />
+        </Setting>
+        <Setting title="Resume after the Mac wakes" hint="If music was playing when the Mac went to sleep, carry on when it wakes. Off keeps it paused.">
+          <Toggle label="Resume after wake" on={s.resumeAfterWake} onChange={(v) => set({ resumeAfterWake: v })} />
         </Setting>
         <Setting title="Keep playing when the window is closed" hint="Closing the window hides it to the menu bar and music continues. Quit from the menu-bar icon.">
           <Toggle label="Hide on close" on={s.hideOnClose} onChange={(v) => set({ hideOnClose: v })} />
@@ -95,7 +104,8 @@ export function SettingsView() {
           <button className="btn" onClick={() => void player.rescan()}>Rescan now</button>
         </Setting>
         <Setting title="Link import tools" hint={<>Needed only for “Add from link”. Install with <span className="code">brew install yt-dlp ffmpeg</span>.</>}>
-          <span className="tag">{tools?.ytdlp ? `yt-dlp ${tools.ytdlp}` : "yt-dlp missing"}</span>
+          <span className={`tag ${tools?.ytdlpOutdated ? "warn" : ""}`}>{tools?.ytdlp ? `yt-dlp ${tools.ytdlp}${tools.ytdlpAgeDays !== null ? ` · ${tools.ytdlpAgeDays} d old` : ""}` : "yt-dlp missing"}</span>
+          {tools?.ytdlpOutdated && tools.canUpdate && <button className="btn" disabled={st.ytUpdating} onClick={() => void player.updateYtdlp()}>{st.ytUpdating ? "Updating…" : "Update"}</button>}
           <span className="tag">{tools?.ffmpeg ? "ffmpeg ✓" : "ffmpeg missing"}</span>
         </Setting>
       </div>

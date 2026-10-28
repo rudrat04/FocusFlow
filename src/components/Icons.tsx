@@ -37,6 +37,9 @@ const paths: Record<string, ReactElement> = {
   shuffleSolid: <><path {...p} d="M3 7h3.500c2 0 3.300 1 4.500 3l2 4c1.200 2 2.500 3 4.500 3H21M3 17h3.500c1.400 0 2.400-.5 3.300-1.500M13.200 8.500C14.200 7.500 15.300 7 16.500 7H21" /><path {...p} d="M18.500 4.500L21 7l-2.500 2.500M18.500 14.500L21 17l-2.500 2.500" /></>,
   minus: <><circle {...p} cx="12" cy="12" r="8.500" /><path {...p} d="M8.500 12h7" /></>,
   grip: <><circle cx="9" cy="7" r="1.400" fill="currentColor" /><circle cx="15" cy="7" r="1.400" fill="currentColor" /><circle cx="9" cy="12" r="1.400" fill="currentColor" /><circle cx="15" cy="12" r="1.400" fill="currentColor" /><circle cx="9" cy="17" r="1.400" fill="currentColor" /><circle cx="15" cy="17" r="1.400" fill="currentColor" /></>,
+  pin: <path {...p} d="M9 4h6l-1 5 3 3v1.500H7V12l3-3zM12 13.500V20" />,
+  expand: <path {...p} d="M14 5h5v5M19 5l-6 6M10 19H5v-5M5 19l6-6" />,
+  mini: <><rect {...p} x="3.500" y="5" width="17" height="13" rx="2.500" /><rect x="11" y="11" width="7" height="5" rx="1" fill="currentColor" stroke="none" /></>,
   wave: <path {...p} d="M4 12h1M8 8v8M12 5v14M16 8v8M20 12h-1" />,
 };
 

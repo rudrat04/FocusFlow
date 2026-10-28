@@ -1,4 +1,5 @@
 import { player, usePlayer, usePosition } from "../lib/player";
+import { api } from "../lib/api";
 import { fmtTime } from "../lib/format";
 import { Icon } from "./Icons";
 import { Artwork } from "./Artwork";
@@ -56,6 +57,7 @@ export function BottomBar() {
       </div>
 
       <div className="right-controls">
+        <button className="icon-btn" aria-label="Open mini player" title="Mini player" onClick={() => void api.miniOpen()}><Icon name="mini" /></button>
         <SleepMenu />
         <button className="icon-btn" aria-label={`Spatial audio: ${SPATIAL_LABEL[settings.spatialMode]}. Click to change`} title={`Spatial: ${SPATIAL_LABEL[settings.spatialMode]}`}
           style={{ color: settings.spatialMode === "off" ? undefined : "var(--accent)" }}

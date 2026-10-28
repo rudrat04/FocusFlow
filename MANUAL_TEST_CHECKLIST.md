@@ -107,3 +107,12 @@ Record at 0 / 30 min / 2 h / 8 h / 24 h (Activity Monitor → FocusFlow and its 
 ## Battery (needs the Mac unplugged)
 - [ ] Note the battery %, play for 1 hour at your normal volume with the window visible, note the % again. Repeat with the window hidden. Compare with another music app for reference.
 - [ ] Activity Monitor → Energy tab: FocusFlow's "Energy Impact" and "12 hr Power" stay low (single digits).
+
+## New in the latest round (none of this could be tested automatically)
+- [ ] **Sleep and wake:** play, close the lid (or Apple menu → Sleep), wake after a minute. With "Resume after the Mac wakes" on, music carries on and a message says how long the Mac slept; with it off, it stays paused.
+- [ ] **Devices:** connect AirPods mid-song (audio should move over within about a second), then switch them off (it should pause, not jump to the speakers).
+- [ ] **Loudness:** import a very quiet and a very loud file. With "Even out loudness" on, they sound about equally loud; toggling it off and on glides without a click.
+- [ ] **Seeking** in a long VBR MP3: click various points; playback starts exactly there.
+- [ ] **Mini player:** open it from the bottom bar and from the menu-bar icon; play/pause, next, previous, seek and favorite work; the pin keeps it above other windows; closing it frees it. Check it looks right in each theme.
+- [ ] **Menu-bar title** shows the song while playing and disappears when paused.
+- [ ] **yt-dlp:** with an old yt-dlp the banner appears; "Update yt-dlp" updates it; a private video and a bot-check video give a clear message (not a raw error).

@@ -6,7 +6,7 @@ export async function installMock() {
   mockWindows("main");
   const mk = (id: number, title: string, album: string, duration: number, fav = false, missing = false): Track => ({
     id, path: `/demo/${id}.mp3`, title, artist: "FocusFlow Demo", album, duration, format: "MP3", size: duration * 40000, sampleRate: 44100, channels: 2,
-    addedAt: 1793000000 + id * 86400, missing, favorite: fav, sourceUrl: null, hasArt: true,
+    addedAt: 1793000000 + id * 86400, missing, favorite: fav, sourceUrl: null, hasArt: true, lufs: -18 + (id % 5), gainDb: 2 - (id % 5),
   });
   const tracks: Track[] = [
     mk(1, "Glass Harbor", "Deep Work", 251, true),
@@ -45,7 +45,7 @@ export async function installMock() {
       }
       case "get_paths": return { libraryDir: "/Users/you/Music/FocusFlow", dataDir: "/tmp" };
       case "engine_status": return { available: true, error: null, device: "MacBook Air Speakers", channels: 2 };
-      case "yt_tools": return { ytdlp: "2026.10.26", ffmpeg: "ffmpeg 9.0.2" };
+      case "yt_tools": return { ytdlp: "2026.10.26", ffmpeg: "ffmpeg 9.0.2", ytdlpAgeDays: 2, ytdlpOutdated: false, canUpdate: true };
       case "kv_load": return kv[a.name as string] ?? null;
       case "kv_save": kv[a.name as string] = a.value; return null;
       case "lib_refresh_missing": return 0;

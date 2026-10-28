@@ -14,7 +14,7 @@ Everything in "Ran" was actually executed on this Mac and passed in the final ru
 | Sleep timer (`timers.test.ts`) | fade then stop, fade clamped to length, minimum 1 min, zero-fade |
 | Track-transition state (`transition.test.ts`) | adopt preloaded next, stale serials ignored, superseded plays ignored, repeat-one, resync on unexpected track |
 
-### Backend: `cargo test --lib` → 32 passed, 0 failed
+### Backend: `cargo test --lib` → 51 passed, 0 failed
 Engine (missing file → error, corrupt file → no panic, gapless promotion without a silent gap, exactly one crossfade transition with bounded level, pause consumes nothing, single track ends once, seek offset), spatializer (off is passthrough; wide/room/orbit stay finite and bounded), library (import files and folders, duplicate skipping by content, corrupt and missing files reported, files that disappear are flagged, **playlists/favorites persisted across closing and reopening the database**, error log), link import (timestamp parsing, name sanitizing, rejects non-links, playlist-link detection, track lists from descriptions and comments, silence-gap cut rules, and a **real-ffmpeg test that builds a file of three tracks separated by silence, finds both gaps, splits it into three MP3s and imports them with the right total duration**), song renaming, keep-awake (acquire/release a real IOKit assertion), album assignment and artwork round-trip, spatializer effect size (each mode must change at least 20–25% of the signal energy at 50% intensity, vs 2–12% before the rewrite; intensity slider scales it; Wide opens a mono source; Room leaves a reverb tail; Orbit swings the left/right balance by about 30 dB).
 
 ### Real files and real audio device: `cargo test --lib -- --ignored` → 3 passed
@@ -22,7 +22,7 @@ Engine (missing file → error, corrupt file → no panic, gapless promotion wit
 - Real output device: play → preloaded next track → crossfade → next becomes current → exactly one `Ended` event; positions advance monotonically.
 - 40 rapid skips (with seeks) on the real device, then pause / resume / stop with correct states and no more than 4 fading tracks at once.
 
-### Real app end to end: `scripts/selftest.sh` → 40 checks passed, 0 failed
+### Real app end to end: `scripts/selftest.sh` → 46 checks passed, 0 failed
 The built app was launched against a throwaway data folder and driven through its real UI code, commands and audio device: import (5 files; re-import = 5 duplicates), play, pause/resume (position frozen while paused), next/previous, 12 rapid Next presses ending in one playing track, seek, automatic advance with a 1 s crossfade, shuffle and repeat-one, spatial modes switching during playback, album grouping, renaming and removing songs from an album, opening a song page, playlist reordering, theme change saved, renaming a song (and refusing an empty title), queue reordering, shuffle-play, the thumbnail play-and-open-Now-Playing action, handing now-playing info to macOS, sleep timer start/cancel, favorites and playlists saved, **a missing file being flagged and skipped to the next playable track with the error logged**, playback state saved, keep-awake released after stop.
 Earlier in development this run **found and fixed a real deadlock** (an unplayable track froze the player), and the unit test for the animation levels found and fixed levels freezing on pause. The results above are after those fixes.
 
@@ -48,6 +48,21 @@ Energy impact is macOS's own figure (as in Activity Monitor), a proxy for batter
 
 What changed: animations and moving themes removed; the audio-analysis code that fed them removed; engine loop 40 ms → 200 ms; decoder polling 15 ms → 150 ms; progress events 4/s → 2/s (every 3 s when the window is hidden); only the progress bars re-render on a tick; scene layers are cached bitmaps; lighter glass blur.
 **Caveats:** run-to-run noise is large (the same scene ranged 0.5–8.7% across runs, depending on what else the Mac was doing and the window state), so treat these as ranges. **Actual battery drain was not measured**: the Mac was plugged in, so only CPU and energy impact were recorded. The unplugged test is in `MANUAL_TEST_CHECKLIST.md`.
+
+## Reliability and quality round (latest)
+
+| Change | How it was verified |
+|---|---|
+| **Exact seeking in VBR MP3** | A VBR MP3 whose loud section starts at exactly 5.000 s. Seeking to six points before it: the loud section lands within **0.1–1.2 ms** of where it should. With the fix disabled the same test was **85–104 ms late**, so the fix is what made the difference. |
+| **Better resampler (rubato FFT)** | A 15 kHz tone converted 44.1→48 kHz: error **−126.6 dB** vs **−8.5 dB** for the old linear interpolation. Output length is exact (to the frame), identical regardless of packet size, equal rates pass through untouched, a resampled file keeps its level and duration, and the real-file tests pass at 44.1 and 48 kHz. |
+| **Loudness normalisation** | Two tones 12.04 dB apart are measured 12.04 dB apart (−20.68 vs −8.64 LUFS) and brought to the same level; a boost can never push a peak past the ceiling; silence is handled; a whole library is analysed once and never again; playback gain scales output exactly (−6 dB halves it) and switching it off glides without a click. In the real app: every track measured in the background. |
+| **Wake detection** | The two-clock method (one clock counts sleep, one doesn't) is unit-tested with simulated values and checked to stay quiet while the Mac is awake. **Not tested with a real sleep/wake.** |
+| **CoreAudio device notifications** | Registration with macOS succeeds and the callback sets the flag. **Not tested with a real device being connected or removed.** |
+| **yt-dlp health and retries** | 12 realistic error messages classified correctly; retry policy tested with fakes (network errors retried twice, blocked/outdated retried once through alternate clients, sign-in and unavailable never retried); version-age arithmetic including leap years. **Not tested against real YouTube; the alternate client names are my best knowledge and unconfirmed.** |
+| **Mini player** | In the real app: the window opens, receives the current song from the main window, and closes (and no longer exists). **Not visually checked in the native window.** |
+| **Efficiency impact** | Playing used about 1.6–1.9% of a core in the app process, up from about 1.0% (the resampler: this Mac's output runs at 48 kHz). Graphics and web-view numbers were within run-to-run noise. Paused: 0.7%. |
+
+Not done: **code signing** (needs a paid Apple Developer account; only matters when sharing the app).
 
 ## Not verified: link import against real videos
 The new detection (description → comments → silence) and playlist/album handling were tested on synthetic data and with a local ffmpeg-built file, not on real YouTube videos. In particular: how yt-dlp's comment extraction behaves on your videos, what YouTube Music album links resolve to, and how well silence detection splits real compilations are unconfirmed. Nothing was downloaded.

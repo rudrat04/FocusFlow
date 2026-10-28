@@ -3,7 +3,7 @@ import { player, usePlayer, type ImportDest } from "../lib/player";
 import { Icon } from "./Icons";
 
 export function ImportLink() {
-  const { showImportLink, ytJobs, tools } = usePlayer();
+  const { showImportLink, ytJobs, tools, ytUpdating } = usePlayer();
   const [links, setLinks] = useState("");
   const [manual, setManual] = useState("");
   const [kind, setKind] = useState<ImportDest["kind"]>("library");
@@ -23,6 +23,14 @@ export function ImportLink() {
             <p className="note" style={{ margin: "0 0 14px" }}>Downloads the audio, splits it at the video’s chapter timestamps, and saves each part as its own MP3 track. Only import audio you have the right to keep; downloading may be against a site’s terms.</p></div>
           <button className="icon-btn" aria-label="Close" onClick={() => player.setImportLinkOpen(false)}><Icon name="x" /></button>
         </div>
+        {tools?.ytdlpOutdated && !missing && (
+          <div className="stale-banner">
+            <span>Your yt-dlp is {tools.ytdlpAgeDays} days old. Downloads often break when it's out of date.</span>
+            {tools.canUpdate
+              ? <button className="btn" disabled={ytUpdating} onClick={() => void player.updateYtdlp()}>{ytUpdating ? "Updating…" : "Update yt-dlp"}</button>
+              : <span className="code">brew upgrade yt-dlp</span>}
+          </div>
+        )}
         {missing && <div className="toast error" style={{ marginBottom: 12, cursor: "default" }}>Needs {!tools?.ytdlp && "yt-dlp"}{!tools?.ytdlp && !tools?.ffmpeg && " and "}{!tools?.ffmpeg && "ffmpeg"}. In Terminal run: <span className="code">brew install yt-dlp ffmpeg</span></div>}
         <label className="note" htmlFor="links">Links (one per line)</label>
         <textarea id="links" className="input" rows={4} placeholder="https://www.youtube.com/watch?v=…" value={links} onChange={(e) => setLinks(e.target.value)} />

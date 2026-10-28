@@ -17,6 +17,9 @@ export interface Track {
   favorite: boolean;
   sourceUrl: string | null;
   hasArt: boolean;
+  /** Measured loudness (LUFS) and the gain (dB) that evens it out; null until analysed. */
+  lufs: number | null;
+  gainDb: number | null;
 }
 
 export interface Playlist {
@@ -47,6 +50,12 @@ export interface Settings {
   repeat: Repeat;
   resumeOnLaunch: boolean;
   keepAwake: boolean;
+  /** After the Mac wakes from sleep, carry on playing (otherwise stay paused). */
+  resumeAfterWake: boolean;
+  /** Even out loudness between tracks. */
+  normalize: boolean;
+  /** Show the current song next to the menu-bar icon. */
+  menuBarTitle: boolean;
   hideOnClose: boolean;
   sleepMinutes: number;
   sleepFadeSecs: number;
@@ -63,6 +72,9 @@ export const DEFAULT_SETTINGS: Settings = {
   repeat: "all",
   resumeOnLaunch: true,
   keepAwake: true,
+  resumeAfterWake: true,
+  normalize: true,
+  menuBarTitle: false,
   hideOnClose: true,
   sleepMinutes: 30,
   sleepFadeSecs: 20,
@@ -79,5 +91,6 @@ export type EngineEvent =
   | { type: "trackError"; path: string; message: string; preload: boolean }
   | { type: "ended"; serial: number }
   | { type: "devicePaused" }
+  | { type: "woke"; sleptSecs: number; resumed: boolean }
   | { type: "fadeComplete" }
   | { type: "outputChanged"; device: string };
